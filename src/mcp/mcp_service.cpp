@@ -164,7 +164,9 @@ json McpToolAdapter::parameters() const
     };
 }
 
-ToolResult McpToolAdapter::execute(const json &args)
+// cwd is unused: MCP tools run on the remote MCP server, arguments are
+// forwarded verbatim via the protocol.
+ToolResult McpToolAdapter::execute(const json &args, const std::string &)
 {
     json response = m_service.callTool(m_toolDef.serverName, m_toolDef.name, args);
 

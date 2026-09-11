@@ -151,11 +151,22 @@ void OpenAIProvider::stream(const LLMRequest &request, LLMEventCallback callback
     std::string bodyStr;
     try {
         bodyStr = body.dump();
+        //LOG_INFO("OpenAI send stream: " + bodyStr);
     } catch (const std::exception &e) {
         LOG_ERROR("OpenAI body.dump() failed: " + std::string(e.what()));
         throw;
     }
-    LOG_INFO("OpenAI stream request body (first 2000): " + bodyStr.substr(0, 2000));
+    // Log only the last user message for debugging
+    std::string lastUserContent;
+    if (body.contains("messages") && body["messages"].is_array()) {
+        for (auto it = body["messages"].rbegin(); it != body["messages"].rend(); ++it) {
+            if (it->contains("role") && (*it)["role"] == "user" && it->contains("content")) {
+                lastUserContent = (*it)["content"].dump().substr(0, 2000);
+                break;
+            }
+        }
+    }
+    LOG_INFO("OpenAI stream last user message: " + lastUserContent);
 
     // Set up headers
     std::vector<std::string> headers;
@@ -171,7 +182,7 @@ void OpenAIProvider::stream(const LLMRequest &request, LLMEventCallback callback
     try {
         HttpClient::postStreaming(url, bodyStr, headers,
             [&parser](const std::string &chunk) {
-                LOG_INFO("[OpenAI] stream chunk received: " + chunk.substr(0, 300));
+                LOG_INFO("[OpenAI] stream chunk received: " + chunk);
                 parser.feed(chunk);
             });
     } catch (const std::exception &e) {
@@ -192,7 +203,7 @@ json OpenAIProvider::chat(const LLMRequest &request)
     if (!m_apiKey.empty()) {
         headers.push_back("Authorization: Bearer " + m_apiKey);
     }
-
+    //LOG_INFO("OpenAI send message: " + body.dump());
     std::string response = HttpClient::post(url, body.dump(), headers);
 
     try {

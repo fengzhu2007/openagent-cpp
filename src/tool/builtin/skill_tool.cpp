@@ -39,7 +39,7 @@ json SkillTool::parameters() const
     };
 }
 
-ToolResult SkillTool::execute(const json &args)
+ToolResult SkillTool::execute(const json &args, const std::string &)
 {
     std::string skillName = args.value("skill", "");
     std::string arguments = args.value("arguments", "");

@@ -2,10 +2,42 @@
 #include "util/logger.h"
 #include <curl/curl.h>
 #include <sstream>
+#include <mutex>
 
 #ifdef _WIN32
 #include <windows.h>
 #endif
+
+// Global proxy setting
+static std::string g_proxyUrl;
+static std::mutex g_proxyMutex;
+
+void HttpClient::setProxy(const std::string &proxyUrl)
+{
+    std::lock_guard<std::mutex> lock(g_proxyMutex);
+    g_proxyUrl = proxyUrl;
+    LOG_INFO("[HttpClient] Proxy set: " + proxyUrl);
+}
+
+std::string HttpClient::proxy()
+{
+    std::lock_guard<std::mutex> lock(g_proxyMutex);
+    return g_proxyUrl;
+}
+
+// Helper: apply proxy settings to curl handle
+static void applyProxy(CURL *curl)
+{
+    std::string proxyUrl;
+    {
+        std::lock_guard<std::mutex> lock(g_proxyMutex);
+        proxyUrl = g_proxyUrl;
+    }
+    if (!proxyUrl.empty()) {
+        curl_easy_setopt(curl, CURLOPT_PROXY, proxyUrl.c_str());
+        curl_easy_setopt(curl, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
+    }
+}
 
 // Convert curl error messages from local codepage (e.g. GBK) to UTF-8
 static std::string curlErrorToUtf8(const char *msg) {
@@ -66,7 +98,7 @@ static size_t streamCaptureCallback(void *contents, size_t size, size_t nmemb, v
 {
     auto *ctx = static_cast<StreamCaptureCtx *>(userp);
     std::string chunk(static_cast<char *>(contents), size * nmemb);
-    LOG_INFO("[HTTP-Stream] chunk: " + chunk.substr(0, 500));
+    LOG_INFO("[HTTP-Stream] chunk: " + chunk);
     (*ctx->callback)(chunk);
     if (ctx->responseBody) {
         *ctx->responseBody += chunk;
@@ -95,6 +127,13 @@ std::string HttpClient::post(const std::string &url, const std::string &body,
 #ifdef CURLSSLOPT_NATIVE_CA
     curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
 #endif
+    // Disable peer verification for compatibility with various proxy/cert configurations
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    // SSL version and ALPN settings for compatibility with local proxies
+    curl_easy_setopt(curl, CURLOPT_SSL_ENABLE_ALPN, 0L);
+    // Apply proxy if configured
+    applyProxy(curl);
 
     struct curl_slist *curlHeaders = nullptr;
     for (const auto &h : headers) {
@@ -143,6 +182,13 @@ std::string HttpClient::get(const std::string &url, const std::vector<std::strin
 #ifdef CURLSSLOPT_NATIVE_CA
     curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
 #endif
+    // Disable peer verification for compatibility with various proxy/cert configurations
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    // SSL version and ALPN settings for compatibility with local proxies
+    curl_easy_setopt(curl, CURLOPT_SSL_ENABLE_ALPN, 0L);
+    // Apply proxy if configured
+    applyProxy(curl);
 
     struct curl_slist *curlHeaders = nullptr;
     for (const auto &h : headers) {
@@ -191,6 +237,13 @@ void HttpClient::postStreaming(const std::string &url, const std::string &body,
 #ifdef CURLSSLOPT_NATIVE_CA
     curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
 #endif
+    // Disable peer verification for compatibility with various proxy/cert configurations
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    // SSL version and ALPN settings for compatibility with local proxies
+    curl_easy_setopt(curl, CURLOPT_SSL_ENABLE_ALPN, 0L);
+    // Apply proxy if configured
+    applyProxy(curl);
 
     struct curl_slist *curlHeaders = nullptr;
     for (const auto &h : headers) {

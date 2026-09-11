@@ -3,6 +3,9 @@
 #include <sstream>
 #include <vector>
 #include <algorithm>
+#ifdef _WIN32
+#include <cstdio>
+#endif
 
 std::mutex EditTool::s_fileMutex;
 
@@ -20,7 +23,7 @@ json EditTool::parameters() const
         {"properties", {
             {"path", {
                 {"type", "string"},
-                {"description", "The file path to edit"}
+                {"description", "The absolute file path to edit"}
             }},
             {"oldText", {
                 {"type", "string"},
@@ -111,9 +114,9 @@ std::string EditTool::generateUnifiedDiff(const std::string &path,
     return diff.str();
 }
 
-ToolResult EditTool::execute(const json &args)
+ToolResult EditTool::execute(const json &args, const std::string &cwd)
 {
-    std::string path = args.value("path", "");
+    std::string path = resolvePath(cwd, args.value("path", ""));
     std::string oldText = args.value("oldText", "");
     std::string newText = args.value("newText", "");
 
@@ -129,15 +132,29 @@ ToolResult EditTool::execute(const json &args)
     std::lock_guard<std::mutex> lock(s_fileMutex);
 
     // Read the entire file
-    std::ifstream inFile(path, std::ios::binary);
-    if (!inFile.is_open()) {
+    std::string content;
+#ifdef _WIN32
+    FILE *inFp = _wfopen(utf8ToWide(path).c_str(), L"rb");
+    if (!inFp) {
         return {false, "", "File not found: " + path, "edit: " + path};
     }
-
-    std::ostringstream ss;
-    ss << inFile.rdbuf();
-    std::string content = ss.str();
-    inFile.close();
+    fseek(inFp, 0, SEEK_END);
+    long fileSize = ftell(inFp);
+    fseek(inFp, 0, SEEK_SET);
+    content.resize(fileSize);
+    fread(&content[0], 1, fileSize, inFp);
+    fclose(inFp);
+#else
+    {
+        std::ifstream inFile(path, std::ios::binary);
+        if (!inFile.is_open()) {
+            return {false, "", "File not found: " + path, "edit: " + path};
+        }
+        std::ostringstream ss;
+        ss << inFile.rdbuf();
+        content = ss.str();
+    }
+#endif
 
     // Detect and preserve BOM
     std::string bom;
@@ -177,17 +194,29 @@ ToolResult EditTool::execute(const json &args)
 
     // Write back with BOM if present
     std::string finalContent = bom + newContent;
-    std::ofstream outFile(path, std::ios::binary | std::ios::trunc);
-    if (!outFile.is_open()) {
+#ifdef _WIN32
+    FILE *outFp = _wfopen(utf8ToWide(path).c_str(), L"wb");
+    if (!outFp) {
         return {false, "", "Failed to open file for writing: " + path, "edit: " + path};
     }
-
-    outFile << finalContent;
-    outFile.close();
-
-    if (outFile.fail()) {
+    size_t written = fwrite(finalContent.data(), 1, finalContent.size(), outFp);
+    fclose(outFp);
+    if (written != finalContent.size()) {
         return {false, "", "Failed to write file: " + path, "edit: " + path};
     }
+#else
+    {
+        std::ofstream outFile(path, std::ios::binary | std::ios::trunc);
+        if (!outFile.is_open()) {
+            return {false, "", "Failed to open file for writing: " + path, "edit: " + path};
+        }
+        outFile << finalContent;
+        outFile.close();
+        if (outFile.fail()) {
+            return {false, "", "Failed to write file: " + path, "edit: " + path};
+        }
+    }
+#endif
 
     // Generate unified diff
     std::string diff = generateUnifiedDiff(path, oldContent, newContent);

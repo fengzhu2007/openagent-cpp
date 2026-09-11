@@ -66,6 +66,7 @@ set(OPENCODE_SOURCES
     src/tool/tool_registry.cpp
     src/tool/truncate.cpp
     src/tool/builtin/shell_tool.cpp
+    src/tool/builtin/shell_common.cpp
     src/tool/builtin/read_tool.cpp
     src/tool/builtin/write_tool.cpp
     src/tool/builtin/edit_tool.cpp
@@ -126,6 +127,7 @@ set(OPENCODE_HEADERS
     src/tool/tool_registry.h
     src/tool/truncate.h
     src/tool/builtin/shell_tool.h
+    src/tool/builtin/shell_common.h
     src/tool/builtin/read_tool.h
     src/tool/builtin/write_tool.h
     src/tool/builtin/edit_tool.h
@@ -154,9 +156,21 @@ set(OPENCODE_HEADERS
     src/pty/pty.h
 )
 
+# Platform-specific headers (for IDE project views)
+if(WIN32)
+    list(APPEND OPENCODE_HEADERS
+        src/tool/builtin/cmd_tool.h
+        src/tool/builtin/powershell_tool.h
+    )
+endif()
+
 # Platform-specific PTY source
 if(WIN32)
-    list(APPEND OPENCODE_SOURCES src/pty/pty_win.cpp)
+    list(APPEND OPENCODE_SOURCES
+        src/pty/pty_win.cpp
+        src/tool/builtin/cmd_tool.cpp
+        src/tool/builtin/powershell_tool.cpp
+    )
 else()
     list(APPEND OPENCODE_SOURCES src/pty/pty_unix.cpp)
 endif()
@@ -181,8 +195,20 @@ target_link_libraries(opencode-cpp PRIVATE sqlite3_lib)
 if(WIN32)
     target_link_libraries(opencode-cpp PRIVATE ws2_32)
     target_compile_definitions(opencode-cpp PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    if(MSVC)
+        # Ensure UTF-8 encoding for source files and string literals
+        target_compile_options(opencode-cpp PRIVATE /utf-8)
+    endif()
 endif()
 
 if(UNIX AND NOT APPLE)
     target_link_libraries(opencode-cpp PRIVATE pthread)
 endif()
+
+# ---- Copy prompts/ directory to exe output dir after build ----
+add_custom_command(TARGET opencode-cpp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/prompts"
+        "$<TARGET_FILE_DIR:opencode-cpp>/prompts"
+    COMMENT "Copying prompts/ to output directory"
+)

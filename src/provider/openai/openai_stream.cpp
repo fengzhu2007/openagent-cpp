@@ -31,7 +31,7 @@ void OpenAIStreamParser::processLine(const std::string &line)
     // Skip empty lines and comments
     if (line.empty() || line[0] == ':') return;
 
-    LOG_INFO("[OpenAI-Stream] line: " + line.substr(0, 300));
+    //LOG_INFO("[OpenAI-Stream] line: " + line.substr(0, 300));
 
     // Parse "data: ..." lines
     const std::string prefix = "data: ";
@@ -49,7 +49,7 @@ void OpenAIStreamParser::processLine(const std::string &line)
     // Parse JSON
     try {
         json chunk = json::parse(data);
-        LOG_INFO("[OpenAI-Stream] parsed JSON: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace).substr(0, 500));
+        //LOG_INFO("[OpenAI-Stream] parsed JSON: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace).substr(0, 500));
 
         // Check for error
         if (chunk.contains("error")) {
@@ -85,16 +85,9 @@ void OpenAIStreamParser::processLine(const std::string &line)
             LLMEvent event;
             event.type = LLMEvent::StepFinish;
 
-            // Flush any pending tool calls
-            for (auto &tc : m_pendingTools) {
-                LLMEvent tcEnd;
-                tcEnd.type = LLMEvent::ToolCallEnd;
-                tcEnd.toolCall = {tc.id, tc.name, {}};
-                try { tcEnd.toolCall.arguments = json::parse(tc.arguments); }
-                catch (...) { tcEnd.toolCall.arguments = {{"raw", tc.arguments}}; }
-                m_callback(tcEnd);
-            }
-            m_pendingTools.clear();
+            // Flush pending tool calls: the finish_reason chunk is the one
+            // flush point of the stream (v1 tool-stream semantics)
+            flushPendingTools();
 
             // Extract usage if available
             if (chunk.contains("usage")) {
@@ -150,33 +143,44 @@ void OpenAIStreamParser::parseDelta(const json &delta)
 
             auto &pending = m_pendingTools[index];
 
-            // New tool call (has id)
+            // The id arrives on the first chunk of a tool call. Some upstreams
+            // (NVIDIA NIM / TensorRT-LLM) emit id:"" on continuation deltas,
+            // so an empty id field means "same call" — keep the current
+            // pending and keep accumulating. Only a genuinely different
+            // non-empty id at this index starts a new call, discarding the
+            // malformed remains of the old one.
             if (tc.contains("id") && !tc["id"].is_null()) {
-                // Flush previous tool call at this index if any
-                if (!pending.id.empty()) {
-                    LLMEvent tcEnd;
-                    tcEnd.type = LLMEvent::ToolCallEnd;
-                    tcEnd.toolCall = {pending.id, pending.name, {}};
-                    try { tcEnd.toolCall.arguments = json::parse(pending.arguments); }
-                    catch (...) { tcEnd.toolCall.arguments = {{"raw", pending.arguments}}; }
-                    m_callback(tcEnd);
-                }
-
-                pending.id = tc["id"].get<std::string>();
-                pending.arguments.clear();
-
-                // Emit tool call start
-                if (tc.contains("function") && tc["function"].contains("name")
-                    && tc["function"]["name"].is_string()) {
-                    pending.name = tc["function"]["name"].get<std::string>();
-                    LLMEvent tcStart;
-                    tcStart.type = LLMEvent::ToolCallStart;
-                    tcStart.toolCall = {pending.id, pending.name, {}};
-                    m_callback(tcStart);
+                std::string newId = tc["id"].get<std::string>();
+                if (!newId.empty()) {
+                    if (pending.id.empty()) {
+                        pending.id = newId;
+                    } else if (pending.id != newId) {
+                        LOG_WARN("Tool call index " + std::to_string(index)
+                                 + " changed id mid-stream, restarting accumulation");
+                        pending = PendingToolCall{};
+                        pending.index = index;
+                        pending.id = newId;
+                    }
                 }
             }
 
-            // Accumulate arguments
+            // Name may arrive with the id or in a later chunk
+            if (tc.contains("function") && tc["function"].contains("name")
+                && tc["function"]["name"].is_string()) {
+                pending.name = tc["function"]["name"].get<std::string>();
+            }
+
+            // Emit ToolCallStart exactly once, when both id and name are known
+            if (!pending.id.empty() && !pending.name.empty() && !pending.startEmitted) {
+                LLMEvent tcStart;
+                tcStart.type = LLMEvent::ToolCallStart;
+                tcStart.toolCall = {pending.id, pending.name, {}};
+                m_callback(tcStart);
+                pending.startEmitted = true;
+            }
+
+            // Accumulate arguments; they are flushed only when the stream
+            // reaches finish_reason or finish()
             if (tc.contains("function") && tc["function"].contains("arguments")
                 && tc["function"]["arguments"].is_string()) {
                 pending.arguments += tc["function"]["arguments"].get<std::string>();
@@ -185,20 +189,26 @@ void OpenAIStreamParser::parseDelta(const json &delta)
     }
 }
 
-void OpenAIStreamParser::finish()
+void OpenAIStreamParser::flushPendingTools()
 {
-    // Flush any remaining pending tool calls
     for (auto &tc : m_pendingTools) {
-        if (!tc.id.empty()) {
-            LLMEvent tcEnd;
-            tcEnd.type = LLMEvent::ToolCallEnd;
-            tcEnd.toolCall = {tc.id, tc.name, {}};
-            try { tcEnd.toolCall.arguments = json::parse(tc.arguments); }
-            catch (...) { tcEnd.toolCall.arguments = {{"raw", tc.arguments}}; }
-            m_callback(tcEnd);
-        }
+        // Skip malformed entries: without an id (or name) the call can never
+        // be matched to a tool result; opencode v1 fails the whole stream in
+        // this case, dropping the entry is the lenient equivalent
+        if (tc.id.empty() || tc.name.empty()) continue;
+        LLMEvent tcEnd;
+        tcEnd.type = LLMEvent::ToolCallEnd;
+        tcEnd.toolCall = {tc.id, tc.name, parseToolArguments(tc.arguments)};
+        m_callback(tcEnd);
     }
     m_pendingTools.clear();
+}
+
+void OpenAIStreamParser::finish()
+{
+    // Flush any remaining pending tool calls (streams that end without a
+    // finish_reason chunk or [DONE])
+    flushPendingTools();
 
     // End text if started
     if (m_textStarted) {

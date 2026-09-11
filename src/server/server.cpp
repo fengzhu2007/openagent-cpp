@@ -5,6 +5,7 @@
 #include "util/logger.h"
 #include "util/uuid.h"
 #include "tool/builtin/shell_tool.h"
+#include "tool/builtin/shell_common.h"
 #include "tool/builtin/skill_tool.h"
 #include <thread>
 #include <chrono>
@@ -146,7 +147,7 @@ Server::Server(const std::string &host, uint16_t port,
 {
     m_sse = std::make_unique<SSEManager>(m_events);
     m_auth = std::make_unique<AuthManager>(m_config);
-    m_permission = std::make_unique<PermissionManager>(m_config, m_events);
+    m_permission = std::make_unique<PermissionManager>(m_db, m_events);
     std::string dataDir = m_config.getString("data_dir", ".");
     std::string worktree = m_config.getString("worktree", ".");
     m_snapshot = std::make_unique<SnapshotManager>(dataDir, worktree);
@@ -175,6 +176,8 @@ Server::Server(const std::string &host, uint16_t port,
     m_memory->setProviderRegistry(&m_providers);
     m_memory->start();
     m_prompt = std::make_unique<SessionPrompt>(m_sessionMgr, m_providers, m_tools, m_events, m_config, m_permission.get(), m_snapshot.get(), m_agents.get(), m_memory.get());
+    // Set the working directories getter so SessionPrompt can access global working dirs
+    m_prompt->setWorkingDirsGetter([this]() { return workingDirs(); });
     setupRoutes();
 }
 
@@ -262,6 +265,14 @@ void Server::setupRoutes()
 
     m_httpServer.Get("/global/event", [this](const httplib::Request &req, httplib::Response &res) {
         handleGlobalEvent(req, res);
+    });
+
+    // Global working directories (set by IDE)
+    m_httpServer.Post("/directories", [this](const httplib::Request &req, httplib::Response &res) {
+        handleSetWorkingDirs(req, res);
+    });
+    m_httpServer.Get("/directories", [this](const httplib::Request &req, httplib::Response &res) {
+        handleGetWorkingDirs(req, res);
     });
 
     // ---- Session routes ----
@@ -1195,6 +1206,58 @@ void Server::handleUpdateSession(const httplib::Request &req, httplib::Response 
     }
 }
 
+// ---- Global working directories ----
+
+void Server::handleSetWorkingDirs(const httplib::Request &req, httplib::Response &res)
+{
+    json body;
+    if (!middleware::parseJSON(req, body)) {
+        middleware::sendError(res, 400, "Invalid JSON body");
+        return;
+    }
+
+    // Parse directories array
+    std::vector<std::string> dirs;
+    if (body.contains("directories") && body["directories"].is_array()) {
+        for (const auto &d : body["directories"]) {
+            if (d.is_string()) dirs.push_back(d.get<std::string>());
+        }
+    } else {
+        middleware::sendError(res, 400, "Missing or invalid 'directories' array");
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_workingDirsMutex);
+        m_workingDirs = dirs;
+    }
+
+    LOG_INFO("[Server] setWorkingDirs: " + std::to_string(dirs.size()) + " dirs");
+
+    json result;
+    result["directories"] = dirs;
+    middleware::sendJSON(res, result.dump(), 200);
+}
+
+void Server::handleGetWorkingDirs(const httplib::Request &, httplib::Response &res)
+{
+    json result;
+    {
+        std::lock_guard<std::mutex> lock(m_workingDirsMutex);
+        result["directories"] = m_workingDirs;
+    }
+    middleware::sendJSON(res, result.dump(), 200);
+}
+
+std::vector<std::string> Server::workingDirs() const
+{
+    // Note: This is a const method, but we need to lock the mutex.
+    // We use const_cast to allow locking the mutable mutex.
+    auto *self = const_cast<Server*>(this);
+    std::lock_guard<std::mutex> lock(self->m_workingDirsMutex);
+    return m_workingDirs;
+}
+
 void Server::handleListMessages(const httplib::Request &req, httplib::Response &res)
 {
     std::string sessionId = Router::sessionId(req.path);
@@ -1261,16 +1324,28 @@ void Server::handleSendMessage(const httplib::Request &req, httplib::Response &r
     if (text.empty() && body.contains("prompt") && body["prompt"].is_object()) {
         text = body["prompt"].value("text", "");
     }
-    if (text.empty() && body.contains("parts") && body["parts"].is_array()) {
-        // opencode format: {"parts": [{"type": "text", "text": "..."}]}
+    // opencode v1 format: {"parts": [{"type": "text", ...}, {"type": "file", ...}]}
+    // Text parts feed the plain-text fallback; the full array (text + file) is
+    // forwarded so the user message records every input part
+    json inputParts = json::array();
+    if (body.contains("parts") && body["parts"].is_array()) {
         for (const auto &part : body["parts"]) {
-            if (part.value("type", "") == "text") {
-                text = part.value("text", "");
-                if (!text.empty()) break;
+            std::string ptype = part.value("type", "");
+            if (ptype == "text") {
+                std::string t = part.value("text", "");
+                if (!t.empty() && text.empty()) text = t;
+            } else if (ptype == "file" && part.contains("url")) {
+                inputParts.push_back(part);
+            } else if (ptype == "agent" && part.contains("name")) {
+                // v1 AgentPartInput: steering the prompt at a named agent
+                inputParts.push_back(part);
+            } else if (ptype == "subtask" && part.contains("prompt")) {
+                // v1 SubtaskPartInput: sub-agent task marker
+                inputParts.push_back(part);
             }
         }
     }
-    if (text.empty()) {
+    if (text.empty() && inputParts.empty()) {
         middleware::sendError(res, 400, "Missing 'text', 'content', 'prompt', or 'parts' in request body");
         return;
     }
@@ -1290,7 +1365,7 @@ void Server::handleSendMessage(const httplib::Request &req, httplib::Response &r
 
     // Run prompt synchronously (blocks until LLM finishes all tool rounds)
     try {
-        m_prompt->prompt(sessionId, text);
+        m_prompt->prompt(sessionId, text, inputParts);
     } catch (const std::exception &e) {
         std::string errMsg = sanitizeUtf8(e.what());
         LOG_ERROR("Prompt error [session=" + sessionId + "]: " + errMsg);
@@ -1351,16 +1426,27 @@ void Server::handlePromptAsync(const httplib::Request &req, httplib::Response &r
     if (text.empty() && body.contains("prompt") && body["prompt"].is_object()) {
         text = body["prompt"].value("text", "");
     }
-    if (text.empty() && body.contains("parts") && body["parts"].is_array()) {
-        // opencode format: {"parts": [{"type": "text", "text": "..."}]}
+    // opencode v1 format: forward the full parts array (text + file) so the
+    // user message records every input part
+    json inputParts = json::array();
+    if (body.contains("parts") && body["parts"].is_array()) {
         for (const auto &part : body["parts"]) {
-            if (part.value("type", "") == "text") {
-                text = part.value("text", "");
-                if (!text.empty()) break;
+            std::string ptype = part.value("type", "");
+            if (ptype == "text") {
+                std::string t = part.value("text", "");
+                if (!t.empty() && text.empty()) text = t;
+            } else if (ptype == "file" && part.contains("url")) {
+                inputParts.push_back(part);
+            } else if (ptype == "agent" && part.contains("name")) {
+                // v1 AgentPartInput: steering the prompt at a named agent
+                inputParts.push_back(part);
+            } else if (ptype == "subtask" && part.contains("prompt")) {
+                // v1 SubtaskPartInput: sub-agent task marker
+                inputParts.push_back(part);
             }
         }
     }
-    if (text.empty()) {
+    if (text.empty() && inputParts.empty()) {
         middleware::sendError(res, 400, "Missing 'text', 'content', 'prompt', or 'parts' in request body");
         return;
     }
@@ -1379,18 +1465,18 @@ void Server::handlePromptAsync(const httplib::Request &req, httplib::Response &r
     }
 
     // Run prompt asynchronously
-    m_prompt->promptAsync(sessionId, text);
+    m_prompt->promptAsync(sessionId, text, inputParts);
 
     bool isV2 = (req.path.rfind("/api/", 0) == 0);
     if (isV2) {
         // V2 format: {data: {id, sessionID, admittedSeq, prompt: {text}}}
         std::string msgId = util::uuid4();
-        json admitted = {
+        json admitted = json::object({
             {"id", msgId},
             {"sessionID", sessionId},
             {"admittedSeq", 0},
-            {"prompt", {{"text", text}}}
-        };
+            {"prompt", json::object({{"text", text}})}
+        });
         middleware::sendDataWrapped(res, admitted, 200);
     } else {
         // Return 204 No Content (old format)
@@ -1677,25 +1763,27 @@ void Server::handleShellCommand(const httplib::Request &req, httplib::Response &
     toolPart.messageId = assistantMsg.id;
     toolPart.sessionId = sessionId;
     toolPart.type = "tool";
-    toolPart.data = {
+    toolPart.data = json::object({
         {"callID", callID},
-        {"tool", "shell"},
-        {"state", {
+        {"tool", defaultShellToolName()},
+        {"state", json::object({
             {"status", "running"},
-            {"input", {{"command", command}}},
-            {"time", {{"start", util::nowMs()}}}
-        }}
-    };
+            {"input", json::object({{"command", command}})},
+            {"time", json::object({{"start", util::nowMs()}})}
+        })}
+    });
     toolPart.timeCreated = util::nowMs();
     toolPart.timeUpdated = toolPart.timeCreated;
     m_sessionMgr.addPart(toolPart);
 
     // Execute the shell command
-    Tool *shellTool = m_tools.getTool("shell");
+    Tool *shellTool = m_tools.getTool(defaultShellToolName());
     ToolResult result;
     if (shellTool) {
         try {
-            result = shellTool->execute({{"command", command}});
+            // Execute inside the session's working directory (empty when the
+            // session has none — the tool then falls back to the process CWD).
+            result = shellTool->execute({{"command", command}}, session->directory);
         } catch (const std::exception &e) {
             result.success = false;
             result.error = std::string("Shell execution error: ") + e.what();
@@ -1707,14 +1795,14 @@ void Server::handleShellCommand(const httplib::Request &req, httplib::Response &
 
     // Update tool part state with result
     std::string status = result.success ? "completed" : "error";
-    toolPart.data["state"] = {
+    toolPart.data["state"] = json::object({
         {"status", status},
-        {"input", {{"command", command}}},
+        {"input", json::object({{"command", command}})},
         {"output", result.success ? result.output : result.error},
-        {"title", "shell"},
+        {"title", defaultShellToolName()},
         {"metadata", json::object()},
-        {"time", {{"start", toolPart.timeCreated}, {"end", util::nowMs()}}}
-    };
+        {"time", json::object({{"start", toolPart.timeCreated}, {"end", util::nowMs()}})}
+    });
     toolPart.timeUpdated = util::nowMs();
     m_sessionMgr.updatePart(toolPart);
 
@@ -1846,15 +1934,41 @@ void Server::handleRevert(const httplib::Request &req, httplib::Response &res)
         return;
     }
 
-    // Track the revert state in session metadata
-    json revertInfo = {
+    // v1 semantics: revert publishes session.diff carrying the changes being
+    // backed out — from the message's step-start snapshot to its last recorded
+    // step-finish snapshot. Both are tree objects, so the diff is still
+    // computable after the restore ran.
+    std::string toHash;
+    for (const auto &p : msg->parts) {
+        if (p.type == "step-finish") toHash = p.data.value("snapshot", "");
+    }
+    json diffs = toHash.empty() ? json::array() : m_snapshot->diffFull(snapshotHash, toHash);
+
+    // Track the revert state in session metadata (v1 shape: summary with
+    // additions/deletions/files totals)
+    int64_t additions = 0, deletions = 0;
+    for (const auto &d : diffs) {
+        additions += d.value("additions", 0);
+        deletions += d.value("deletions", 0);
+    }
+    json revertInfo = json::object({
         {"revertedMessageID", messageId},
         {"snapshotHash", snapshotHash},
-        {"timeReverted", util::nowMs()}
-    };
+        {"timeReverted", util::nowMs()},
+        {"summary", json::object({
+            {"additions", additions},
+            {"deletions", deletions},
+            {"files", diffs.size()}
+        })}
+    });
     m_sessionMgr.updateSession(sessionId, {{"metadata.revert", revertInfo}});
 
-    middleware::sendJSON(res, json({{"ok", true}, {"snapshotHash", snapshotHash}}).dump(), 200);
+    m_events.publish(EventType::SessionDiff, {
+        {"sessionID", sessionId},
+        {"diff", diffs}
+    });
+
+    middleware::sendJSON(res, json::object({{"ok", true}, {"snapshotHash", snapshotHash}, {"diff", diffs}}).dump(), 200);
 }
 
 void Server::handleUnrevert(const httplib::Request &req, httplib::Response &res)
@@ -1882,7 +1996,7 @@ void Server::handleUnrevert(const httplib::Request &req, httplib::Response &res)
     // Clear revert metadata
     m_sessionMgr.updateSession(sessionId, {{"metadata.revert", json(nullptr)}});
 
-    middleware::sendJSON(res, json({{"ok", true}, {"snapshotHash", currentHash}}).dump(), 200);
+    middleware::sendJSON(res, json::object({{"ok", true}, {"snapshotHash", currentHash}}).dump(), 200);
 }
 
 void Server::handleDiff(const httplib::Request &req, httplib::Response &res)
@@ -1919,15 +2033,14 @@ void Server::handleDiff(const httplib::Request &req, httplib::Response &res)
         return;
     }
 
-    auto patches = m_snapshot->patch(snapshotHash);
-
-    json result = json::array();
-    for (const auto &p : patches) {
-        result.push_back({
-            {"file", p.filePath},
-            {"status", p.status}
-        });
+    // v1 summary.diff shape: [{file, patch, additions, deletions, status}]
+    // computed from the message's step-start snapshot to its last recorded
+    // step-finish snapshot (the changes this message's steps made)
+    std::string toHash;
+    for (const auto &p : msg->parts) {
+        if (p.type == "step-finish") toHash = p.data.value("snapshot", "");
     }
+    json result = toHash.empty() ? json::array() : m_snapshot->diffFull(snapshotHash, toHash);
 
     middleware::sendJSON(res, result.dump(), 200);
 }
@@ -1994,24 +2107,24 @@ void Server::handleExecuteCommand(const httplib::Request &req, httplib::Response
         toolPart.messageId = assistantMsg.id;
         toolPart.sessionId = sessionId;
         toolPart.type = "tool";
-        toolPart.data = {
+        toolPart.data = json::object({
             {"callID", callID2},
-            {"tool", "shell"},
-            {"state", {
+            {"tool", defaultShellToolName()},
+            {"state", json::object({
                 {"status", "running"},
-                {"input", {{"command", shellCmd}}},
-                {"time", {{"start", util::nowMs()}}}
-            }}
-        };
+                {"input", json::object({{"command", shellCmd}})},
+                {"time", json::object({{"start", util::nowMs()}})}
+            })}
+        });
         toolPart.timeCreated = util::nowMs();
         toolPart.timeUpdated = toolPart.timeCreated;
         m_sessionMgr.addPart(toolPart);
 
-        Tool *shellTool = m_tools.getTool("shell");
+        Tool *shellTool = m_tools.getTool(defaultShellToolName());
         ToolResult result;
         if (shellTool) {
             try {
-                result = shellTool->execute({{"command", shellCmd}});
+                result = shellTool->execute({{"command", shellCmd}}, session->directory);
             } catch (const std::exception &e) {
                 result.success = false;
                 result.error = std::string("Shell execution error: ") + e.what();
@@ -2022,14 +2135,14 @@ void Server::handleExecuteCommand(const httplib::Request &req, httplib::Response
         }
 
         std::string status2 = result.success ? "completed" : "error";
-        toolPart.data["state"] = {
+        toolPart.data["state"] = json::object({
             {"status", status2},
-            {"input", {{"command", shellCmd}}},
+            {"input", json::object({{"command", shellCmd}})},
             {"output", result.success ? result.output : result.error},
-            {"title", "shell"},
+            {"title", defaultShellToolName()},
             {"metadata", json::object()},
-            {"time", {{"start", toolPart.timeCreated}, {"end", util::nowMs()}}}
-        };
+            {"time", json::object({{"start", toolPart.timeCreated}, {"end", util::nowMs()}})}
+        });
         toolPart.timeUpdated = util::nowMs();
         m_sessionMgr.updatePart(toolPart);
 
@@ -2050,7 +2163,7 @@ void Server::handleExecuteCommand(const httplib::Request &req, httplib::Response
         // Run prompt on child session
         m_prompt->promptAsync(child.id, promptText);
 
-        middleware::sendJSON(res, json({
+        middleware::sendJSON(res, json::object({
             {"ok", true},
             {"sessionID", child.id},
             {"parentSessionID", sessionId}
@@ -2061,7 +2174,7 @@ void Server::handleExecuteCommand(const httplib::Request &req, httplib::Response
     // Normal command: run as prompt in current session
     m_prompt->promptAsync(sessionId, promptText);
 
-    middleware::sendJSON(res, json({
+    middleware::sendJSON(res, json::object({
         {"ok", true},
         {"command", commandName},
         {"prompt", promptText}
@@ -2457,11 +2570,11 @@ void Server::handleShareSession(const httplib::Request &req, httplib::Response &
         return;
     }
     // Mark session as shared in metadata
-    json shareInfo = {
+    json shareInfo = json::object({
         {"shared", true},
         {"timeShared", util::nowMs()},
         {"url", nullptr}
-    };
+    });
     m_sessionMgr.updateSession(sessionId, {{"metadata.share", shareInfo}});
     session = m_sessionMgr.getSession(sessionId);
     if (session) {
@@ -2479,7 +2592,7 @@ void Server::handleUnshareSession(const httplib::Request &req, httplib::Response
         middleware::sendError(res, 404, "Session not found: " + sessionId);
         return;
     }
-    json shareInfo = {{"shared", false}};
+    json shareInfo = json::object({{"shared", false}});
     m_sessionMgr.updateSession(sessionId, {{"metadata.share", shareInfo}});
     session = m_sessionMgr.getSession(sessionId);
     if (session) {
@@ -2562,35 +2675,35 @@ void Server::handleListModels(const httplib::Request &, httplib::Response &res)
             // Capabilities
             json inputMods = json::array({"text"});
             json outputMods = json::array({"text"});
-            model["capabilities"] = {
+            model["capabilities"] = json::object({
                 {"tools", m.toolCall},
                 {"input", inputMods},
                 {"output", outputMods}
-            };
+            });
 
             // Limits
-            model["limit"] = {
+            model["limit"] = json::object({
                 {"context", m.limit.context},
                 {"output", m.limit.output}
-            };
+            });
 
             // Cost
-            json costEntry = {
+            json costEntry = json::object({
                 {"input", m.cost.input},
                 {"output", m.cost.output},
-                {"cache", {{"read", m.cost.cacheRead}, {"write", m.cost.cacheWrite}}}
-            };
+                {"cache", json::object({{"read", m.cost.cacheRead}, {"write", m.cost.cacheWrite}})}
+            });
             model["cost"] = json::array({costEntry});
 
             // Request
-            model["request"] = {
+            model["request"] = json::object({
                 {"headers", json::object()},
                 {"body", json::object()}
-            };
+            });
 
             // Variants & time
             model["variants"] = json::array();
-            model["time"] = {{"released", 0}};
+            model["time"] = json::object({{"released", 0}});
 
             modelsArr.push_back(model);
         }
@@ -2693,7 +2806,7 @@ void Server::handleFindText(const httplib::Request &req, httplib::Response &res)
         return;
     }
     json args = {{"pattern", pattern}, {"path", workDir}};
-    ToolResult result = grepTool->execute(args);
+    ToolResult result = grepTool->execute(args, workDir);
     if (result.success) {
         // Parse grep output into match objects
         json matches = json::array();
@@ -2742,7 +2855,7 @@ void Server::handleFindFile(const httplib::Request &req, httplib::Response &res)
     int limit = 50;
     if (req.has_param("limit")) limit = safeStoi(req.get_param_value("limit"));
     args["limit"] = limit;
-    ToolResult result = globTool->execute(args);
+    ToolResult result = globTool->execute(args, workDir);
     if (result.success) {
         json paths = json::array();
         std::istringstream ss(result.output);
@@ -3026,7 +3139,7 @@ void Server::handleListSkills(const httplib::Request &req, httplib::Response &re
 void Server::handleDisposeInstance(const httplib::Request &, httplib::Response &res)
 {
     // Signal that this instance should be disposed
-    m_events.publish("server.instance.disposed", {{"time", util::nowMs()}});
+    m_events.publish("server.instance.disposed", json::object({{"time", util::nowMs()}}));
     middleware::sendJSON(res, R"({"ok":true})", 200);
 }
 
@@ -3044,7 +3157,7 @@ void Server::handleGlobalConfigUpdate(const httplib::Request &req, httplib::Resp
 
 void Server::handleGlobalDispose(const httplib::Request &, httplib::Response &res)
 {
-    m_events.publish("global.disposed", {{"time", util::nowMs()}});
+    m_events.publish("global.disposed", json::object({{"time", util::nowMs()}}));
     middleware::sendJSON(res, R"({"ok":true})", 200);
 }
 
@@ -3100,9 +3213,9 @@ void Server::handleExperimentalToolList(const httplib::Request &req, httplib::Re
 
 void Server::handleExperimentalCapabilities(const httplib::Request &, httplib::Response &res)
 {
-    json result = {
+    json result = json::object({
         {"backgroundSubagents", false}
-    };
+    });
     middleware::sendJSON(res, result.dump(), 200);
 }
 
@@ -3152,11 +3265,11 @@ void Server::handleMcpStatus(const httplib::Request &, httplib::Response &res)
         for (const auto &t : tools) {
             std::string srv = t.serverName;
             if (!servers.contains(srv)) {
-                servers[srv] = {
+                servers[srv] = json::object({
                     {"name", srv},
                     {"status", "connected"},
                     {"tools", json::array()}
-                };
+                });
             }
             servers[srv]["tools"].push_back(t.name);
         }
@@ -3200,12 +3313,12 @@ void Server::handlePtyShells(const httplib::Request &, httplib::Response &res)
 {
     json shells = json::array();
 #ifdef _WIN32
-    shells.push_back({{"path", "C:\\Windows\\System32\\cmd.exe"}, {"name", "cmd"}, {"acceptable", true}});
-    shells.push_back({{"path", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"}, {"name", "powershell"}, {"acceptable", true}});
+    shells.push_back(json::object({{"path", "C:\\Windows\\System32\\cmd.exe"}, {"name", "cmd"}, {"acceptable", true}}));
+    shells.push_back(json::object({{"path", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"}, {"name", "powershell"}, {"acceptable", true}}));
 #else
-    shells.push_back({{"path", "/bin/bash"}, {"name", "bash"}, {"acceptable", true}});
-    shells.push_back({{"path", "/bin/sh"}, {"name", "sh"}, {"acceptable", true}});
-    shells.push_back({{"path", "/bin/zsh"}, {"name", "zsh"}, {"acceptable", true}});
+    shells.push_back(json::object({{"path", "/bin/bash"}, {"name", "bash"}, {"acceptable", true}}));
+    shells.push_back(json::object({{"path", "/bin/sh"}, {"name", "sh"}, {"acceptable", true}}));
+    shells.push_back(json::object({{"path", "/bin/zsh"}, {"name", "zsh"}, {"acceptable", true}}));
 #endif
     middleware::sendJSON(res, shells.dump(), 200);
 }
@@ -3532,7 +3645,7 @@ void Server::handleClearMemories(const httplib::Request &req, httplib::Response 
     }
 
     int count = m_memory->clearProjectMemories(projectId);
-    middleware::sendJSON(res, json{{"ok", true}, {"deleted", count}}.dump(), 200);
+    middleware::sendJSON(res, json::object({{"ok", true}, {"deleted", count}}).dump(), 200);
 }
 
 void Server::handleExportMemories(const httplib::Request &req, httplib::Response &res)
@@ -3693,7 +3806,7 @@ void Server::handleRevertStage(const httplib::Request &req, httplib::Response &r
     if (m_snapshot && m_snapshot->isInitialized()) {
         hash = m_snapshot->track();
     }
-    json state = {{"hash", hash}, {"staged", !hash.empty()}};
+    json state = json::object({{"hash", hash}, {"staged", !hash.empty()}});
     middleware::sendDataWrapped(res, state, 200);
 }
 
@@ -3755,7 +3868,7 @@ void Server::handleSessionHistory(const httplib::Request &req, httplib::Response
         data.push_back(msg.toWithPartsJson());
     }
     bool hasMore = (static_cast<int>(messages.size()) >= limit);
-    json result = {{"data", data}, {"hasMore", hasMore}};
+    json result = json::object({{"data", data}, {"hasMore", hasMore}});
     res.status = 200;
     res.set_content(result.dump(), "application/json");
     middleware::addCORS(res);

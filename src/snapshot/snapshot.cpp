@@ -6,6 +6,8 @@
 #include <sstream>
 #include <algorithm>
 #include <functional>
+#include <unordered_map>
+#include <cstdlib>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -88,11 +90,19 @@ std::string SnapshotManager::gitExec(const std::string &args, bool inWorktree) c
 {
     std::string cmd;
     if (inWorktree) {
-        // Execute in the worktree with GIT_DIR pointing to our snapshot repo
+        // Execute in the worktree with GIT_DIR pointing to our snapshot repo.
+        // Use platform-appropriate environment variable syntax.
+#ifdef _WIN32
+        cmd = "cd /d \"" + m_worktree + "\" && "
+              "set GIT_DIR=\"" + m_repoPath + "\" && "
+              "set GIT_WORK_TREE=\"" + m_worktree + "\" && "
+              "git " + args + " 2>&1";
+#else
         cmd = "cd \"" + m_worktree + "\" && "
               "GIT_DIR=\"" + m_repoPath + "\" "
               "GIT_WORK_TREE=\"" + m_worktree + "\" "
               "git " + args + " 2>&1";
+#endif
     } else {
         cmd = "git " + args + " 2>&1";
     }
@@ -166,6 +176,61 @@ std::vector<PatchEntry> SnapshotManager::patch(const std::string &treeHash) cons
     if (currentTree.empty()) return {};
 
     return diffTrees(treeHash, currentTree);
+}
+
+json SnapshotManager::diffFull(const std::string &fromHash, const std::string &toHash) const
+{
+    json result = json::array();
+    if (!m_initialized) return result;
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    // Status per file (v1: git diff --name-status; "A"/"D"/"M")
+    std::unordered_map<std::string, std::string> statusMap;
+    {
+        std::string nameStatus = gitExec(
+            "diff --no-ext-diff --no-renames --name-status " + fromHash + " " + toHash + " -- .", true);
+        std::istringstream stream(nameStatus);
+        std::string line;
+        while (std::getline(stream, line)) {
+            auto tab = line.find('\t');
+            if (tab == std::string::npos) continue;
+            std::string code = line.substr(0, tab);
+            std::string file = line.substr(tab + 1);
+            statusMap[file] = code.rfind('A', 0) == 0 ? "added"
+                            : code.rfind('D', 0) == 0 ? "deleted" : "modified";
+        }
+    }
+
+    // Additions/deletions per file (v1: git diff --numstat; "-\t-" means binary)
+    std::string numstat = gitExec(
+        "diff --no-ext-diff --no-renames --numstat " + fromHash + " " + toHash + " -- .", true);
+    std::istringstream stream(numstat);
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (line.empty()) continue;
+        auto t1 = line.find('\t');
+        if (t1 == std::string::npos) continue;
+        auto t2 = line.find('\t', t1 + 1);
+        if (t2 == std::string::npos) continue;
+        std::string adds = line.substr(0, t1);
+        std::string dels = line.substr(t1 + 1, t2 - t1 - 1);
+        std::string file = line.substr(t2 + 1);
+        bool binary = adds == "-" && dels == "-";
+
+        json d;
+        d["file"] = file;
+        d["additions"] = binary ? 0 : std::atoi(adds.c_str());
+        d["deletions"] = binary ? 0 : std::atoi(dels.c_str());
+        auto st = statusMap.find(file);
+        d["status"] = st != statusMap.end() ? st->second : "modified";
+        // v1 renders whole-file context diffs (jsdiff with unlimited
+        // context); mirror that with a huge -U value. Binary files get "".
+        d["patch"] = binary ? "" : gitExec(
+            "diff --no-ext-diff --no-renames -U1000000 " + fromHash + " " + toHash + " -- \"" + file + "\"", true);
+        result.push_back(d);
+    }
+
+    return result;
 }
 
 std::vector<PatchEntry> SnapshotManager::diffTrees(const std::string &fromHash, const std::string &toHash) const

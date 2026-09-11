@@ -16,6 +16,7 @@ namespace EventType {
     constexpr const char *SessionDeleted   = "session.deleted";
     constexpr const char *SessionStatus    = "session.status";
     constexpr const char *SessionError     = "session.error";
+    constexpr const char *SessionDiff      = "session.diff";
 
     // Message events
     constexpr const char *MessageUpdated   = "message.updated";
@@ -36,6 +37,7 @@ namespace EventType {
     // Question events (opencode uses "question.asked")
     constexpr const char *QuestionAsked    = "question.asked";
     constexpr const char *QuestionReplied  = "question.replied";
+    constexpr const char *QuestionRejected = "question.rejected";
 
     // Memory events
     constexpr const char *MemoryCreated    = "memory.created";

@@ -88,7 +88,7 @@ void AgentManager::loadBuiltins()
                            "and actionable recommendations.";
         plan.temperature = 0.3;
         plan.maxSteps = 15;
-        plan.deniedTools = {"write", "edit", "shell"};
+        plan.deniedTools = {"write", "edit", "shell", "cmd", "powershell"};
         plan.allowedTools = {"read", "glob", "grep"};
         m_agents[plan.id] = plan;
     }

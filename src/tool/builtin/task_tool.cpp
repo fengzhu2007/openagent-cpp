@@ -40,7 +40,7 @@ json TaskTool::parameters() const
     };
 }
 
-ToolResult TaskTool::execute(const json &args)
+ToolResult TaskTool::execute(const json &args, const std::string &)
 {
     std::string description = args.value("description", "sub-task");
     std::string prompt = args.value("prompt", "");
@@ -75,6 +75,18 @@ ToolResult TaskTool::execute(const json &args)
 
     LOG_INFO("Task tool: created child session " + child.id + " for task: " + description);
 
+    // v1 SubtaskPart: the child's first user message records the sub-task
+    // (prompt/description/agent/model) so the transcript shows what ran
+    json subtaskPart = {
+        {"type", "subtask"},
+        {"prompt", prompt},
+        {"description", description},
+        {"agent", parentSession && !parentSession->agentId.empty() ? parentSession->agentId : "build"}
+    };
+    if (!providerId.empty() && !model.empty()) {
+        subtaskPart["model"] = {{"providerID", providerId}, {"modelID", model}};
+    }
+
     // Run prompt synchronously in the child session
     // We create a temporary SessionPrompt for the child
     SessionPrompt childPrompt(m_sessionMgr, m_providers, m_tools, m_events, m_config);
@@ -84,7 +96,7 @@ ToolResult TaskTool::execute(const json &args)
 
     // Run the prompt (synchronous, blocks until done)
     try {
-        childPrompt.prompt(child.id, prompt);
+        childPrompt.prompt(child.id, prompt, json::array({subtaskPart}));
     } catch (const std::exception &e) {
         LOG_ERROR("Task tool error: " + std::string(e.what()));
         return {false, "", std::string("Task execution error: ") + e.what(),

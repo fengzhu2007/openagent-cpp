@@ -39,19 +39,19 @@ json SessionInfo::toJson() const
         j["metadata"] = metadata;
     }
     // Nested time object
-    j["time"] = {
+    j["time"] = json::object({
         {"created", timeCreated},
         {"updated", timeUpdated}
-    };
+    });
     if (timeArchived > 0) j["time"]["archived"] = timeArchived;
     // Nested tokens object
     if (tokensInput > 0 || tokensOutput > 0) {
-        j["tokens"] = {
+        j["tokens"] = json::object({
             {"input", tokensInput},
             {"output", tokensOutput},
             {"reasoning", 0},
-            {"cache", {{"read", 0}, {"write", 0}}}
-        };
+            {"cache", json::object({{"read", 0}, {"write", 0}})}
+        });
     }
     if (cost > 0) j["cost"] = cost;
     return j;
@@ -408,12 +408,12 @@ bool SessionManager::deleteMessage(const std::string &sessionId, const std::stri
         ok = m_db.execute("DELETE FROM message WHERE id = ? AND session_id = ?", {messageId, sessionId});
     }
     if (ok) {
-        m_events.publish(EventType::MessageUpdated, {{"id", messageId}, {"sessionID", sessionId}, {"deleted", true}});
+        m_events.publish(EventType::MessageUpdated, json::object({{"id", messageId}, {"sessionID", sessionId}, {"deleted", true}}));
     }
     return ok;
 }
 
-Part SessionManager::addPart(const Part &part)
+Part SessionManager::addPart(const Part &part, bool publish)
 {
     json eventData;
     {
@@ -421,7 +421,11 @@ Part SessionManager::addPart(const Part &part)
         savePartToDb(part);
         eventData = {{"sessionID", part.sessionId}, {"part", part.toJson()}, {"time", util::nowMs()}};
     }
-    m_events.publish(EventType::PartUpdated, eventData);
+    // tool-result parts are an internal storage shape (toWithPartsJson merges
+    // them into tool parts); opencode never emits them on the event stream.
+    if (publish) {
+        m_events.publish(EventType::PartUpdated, eventData);
+    }
     return part;
 }
 
@@ -496,9 +500,9 @@ bool SessionManager::deletePart(const std::string &sessionId, const std::string 
             {partId, messageId, sessionId});
     }
     if (ok) {
-        m_events.publish(EventType::PartUpdated, {
+        m_events.publish(EventType::PartUpdated, json::object({
             {"id", partId}, {"messageID", messageId}, {"sessionID", sessionId}, {"deleted", true}
-        });
+        }));
     }
     return ok;
 }

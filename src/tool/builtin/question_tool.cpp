@@ -32,7 +32,7 @@ json QuestionTool::parameters() const
     };
 }
 
-ToolResult QuestionTool::execute(const json &args)
+ToolResult QuestionTool::execute(const json &args, const std::string &)
 {
     std::string question = args.value("question", "");
     if (question.empty()) {

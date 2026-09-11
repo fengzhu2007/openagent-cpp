@@ -35,6 +35,10 @@ public:
     // Get the diff (list of changed files) between a snapshot hash and current state
     std::vector<PatchEntry> patch(const std::string &treeHash) const;
 
+    // Compute full per-file diffs between two tree hashes (v1 FileDiff.Info
+    // shape: file/patch/additions/deletions/status); used by session.diff
+    json diffFull(const std::string &fromHash, const std::string &toHash) const;
+
     // Restore files to the state captured in a specific tree hash
     bool restore(const std::string &treeHash);
 

@@ -10,12 +10,14 @@ namespace SystemPrompt {
 std::string build(const std::string &modelId,
                   const std::string &providerId,
                   const std::string &directory,
-                  const Config &config);
+                  const Config &config,
+                  const std::vector<std::string> &workingDirs = {});
 
 // Build environment information block
 std::string buildEnvironmentInfo(const std::string &modelId,
                                   const std::string &providerId,
-                                  const std::string &directory);
+                                  const std::string &directory,
+                                  const std::vector<std::string> &workingDirs = {});
 
 // Load AGENTS.md / CLAUDE.md instructions from global, project, and config paths
 std::vector<std::string> loadInstructions(const std::string &directory,
@@ -36,6 +38,9 @@ std::string findFileUp(const std::string &startDir, const std::string &filename)
 
 // Read file content (returns empty string if file doesn't exist)
 std::string readFileContent(const std::string &path);
+
+// Load a prompt file from the prompts/ directory (searches exe dir, parent dirs, and cwd)
+std::string loadPromptText(const std::string &fileName);
 
 // Check if a directory is a git repository
 bool isGitRepo(const std::string &directory);

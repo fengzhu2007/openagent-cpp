@@ -94,15 +94,9 @@ std::pair<std::string, json> AnthropicProvider::buildMessages(const LLMRequest &
                 toolBlock["type"] = "tool_use";
                 toolBlock["id"] = tc.id;
                 toolBlock["name"] = tc.name;
-                if (tc.arguments.is_string()) {
-                    try {
-                        toolBlock["input"] = json::parse(tc.arguments.get<std::string>());
-                    } catch (...) {
-                        toolBlock["input"] = {{"raw", tc.arguments.get<std::string>()}};
-                    }
-                } else {
-                    toolBlock["input"] = tc.arguments;
-                }
+                toolBlock["input"] = tc.arguments.is_string()
+                    ? parseToolArguments(tc.arguments.get<std::string>())
+                    : tc.arguments;
                 content.push_back(toolBlock);
             }
 

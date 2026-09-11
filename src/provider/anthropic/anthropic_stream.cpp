@@ -146,13 +146,13 @@ void AnthropicStreamParser::handleContentBlockStop(const json &event)
         end.type = LLMEvent::TextEnd;
         m_callback(end);
     } else if (m_currentBlockType == ToolUse && !m_pendingTools.empty()) {
-        // Flush the completed tool call
-        auto &tool = m_pendingTools.back();
+        // Flush the completed tool call and drop it from the pending list so
+        // finish() cannot flush it a second time
+        PendingTool tool = std::move(m_pendingTools.back());
+        m_pendingTools.pop_back();
         LLMEvent tcEnd;
         tcEnd.type = LLMEvent::ToolCallEnd;
-        tcEnd.toolCall = {tool.id, tool.name, {}};
-        try { tcEnd.toolCall.arguments = json::parse(tool.inputJson); }
-        catch (...) { tcEnd.toolCall.arguments = {{"raw", tool.inputJson}}; }
+        tcEnd.toolCall = {tool.id, tool.name, parseToolArguments(tool.inputJson)};
         m_callback(tcEnd);
     }
 
@@ -198,14 +198,13 @@ void AnthropicStreamParser::finish()
         m_textStarted = false;
     }
 
-    // Flush any remaining pending tool calls
+    // Flush any remaining pending tool calls — normally already flushed by
+    // content_block_stop, only reached on malformed streams
     for (auto &tool : m_pendingTools) {
         if (!tool.id.empty()) {
             LLMEvent tcEnd;
             tcEnd.type = LLMEvent::ToolCallEnd;
-            tcEnd.toolCall = {tool.id, tool.name, {}};
-            try { tcEnd.toolCall.arguments = json::parse(tool.inputJson); }
-            catch (...) { tcEnd.toolCall.arguments = {{"raw", tool.inputJson}}; }
+            tcEnd.toolCall = {tool.id, tool.name, parseToolArguments(tool.inputJson)};
             m_callback(tcEnd);
         }
     }

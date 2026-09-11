@@ -7,5 +7,5 @@ public:
     std::string name() const override { return "shell"; }
     std::string description() const override;
     json parameters() const override;
-    ToolResult execute(const json &args) override;
+    ToolResult execute(const json &args, const std::string &cwd) override;
 };

@@ -27,7 +27,8 @@ namespace SystemPrompt {
 std::string build(const std::string &modelId,
                   const std::string &providerId,
                   const std::string &directory,
-                  const Config &config)
+                  const Config &config,
+                  const std::vector<std::string> &workingDirs)
 {
     std::ostringstream ss;
 
@@ -38,7 +39,7 @@ std::string build(const std::string &modelId,
     }
 
     // 2. Environment information
-    ss << buildEnvironmentInfo(modelId, providerId, directory);
+    ss << buildEnvironmentInfo(modelId, providerId, directory, workingDirs);
 
     // 3. Instructions from AGENTS.md / config
     auto instructions = loadInstructions(directory, config);
@@ -53,17 +54,29 @@ std::string build(const std::string &modelId,
 
 std::string buildEnvironmentInfo(const std::string &modelId,
                                   const std::string &providerId,
-                                  const std::string &directory)
+                                  const std::string &directory,
+                                  const std::vector<std::string> &workingDirs)
 {
     std::ostringstream ss;
     ss << "You are powered by the model named " << modelId
        << ". The exact model ID is " << providerId << "/" << modelId << "\n";
     ss << "Here is some useful information about the environment you are running in:\n";
     ss << "<env>\n";
-    ss << "  Working directory: " << directory << "\n";
-    ss << "  Workspace root folder: " << directory << "\n";
-    bool gitRepo = isGitRepo(directory);
-    ss << "  Is directory a git repo: " << (gitRepo ? "yes" : "no") << "\n";
+    // If multiple working directories are provided, list them all
+    if (!workingDirs.empty()) {
+        ss << "  Working directories:\n";
+        for (const auto &dir : workingDirs) {
+            ss << "    - " << dir << "\n";
+        }
+        ss << "  Workspace root folder: " << workingDirs[0] << "\n";
+        bool gitRepo = isGitRepo(workingDirs[0]);
+        ss << "  Is directory a git repo: " << (gitRepo ? "yes" : "no") << "\n";
+    } else {
+        ss << "  Working directory: " << directory << "\n";
+        ss << "  Workspace root folder: " << directory << "\n";
+        bool gitRepo = isGitRepo(directory);
+        ss << "  Is directory a git repo: " << (gitRepo ? "yes" : "no") << "\n";
+    }
     ss << "  Platform: " << platformName() << "\n";
     ss << "  Today's date: " << currentDateStr() << "\n";
     ss << "</env>\n";
@@ -224,7 +237,7 @@ static void replaceAllIn(std::string &s, const std::string &from, const std::str
     }
 }
 
-static std::string loadPromptText(const std::string &fileName)
+std::string loadPromptText(const std::string &fileName)
 {
     // 1. Next to the executable (deployed layout: <exe dir>/prompts/<file>)
     std::string exeDir = getExecutableDir();

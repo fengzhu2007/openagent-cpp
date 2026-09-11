@@ -34,6 +34,10 @@ public:
 
     // Get the permission manager (for integration with other modules)
     PermissionManager *permissionManager() { return m_permission.get(); }
+
+    // Get the global working directories
+    std::vector<std::string> workingDirs() const;
+
     ~Server();
 
     // Start the HTTP server (non-blocking, runs in background threads)
@@ -49,6 +53,8 @@ private:
     // Global routes
     void handleHealth(const httplib::Request &req, httplib::Response &res);
     void handleGlobalEvent(const httplib::Request &req, httplib::Response &res);
+    void handleSetWorkingDirs(const httplib::Request &req, httplib::Response &res);  // POST /directories
+    void handleGetWorkingDirs(const httplib::Request &req, httplib::Response &res);  // GET /directories
 
     // Session routes
     void handleListSessions(const httplib::Request &req, httplib::Response &res);
@@ -299,5 +305,10 @@ private:
     std::unique_ptr<SyncManager> m_sync;
     std::unique_ptr<ProjectManager> m_projects;
     std::unique_ptr<MemoryManager> m_memory;
+
+    // Global working directories (set by IDE)
+    std::vector<std::string> m_workingDirs;
+    std::mutex m_workingDirsMutex;
+
     std::thread m_serverThread;
 };

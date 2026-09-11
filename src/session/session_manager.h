@@ -74,7 +74,7 @@ public:
     bool deleteMessage(const std::string &sessionId, const std::string &messageId);
 
     // Part management
-    Part addPart(const Part &part);
+    Part addPart(const Part &part, bool publish = true);
     Part *getPart(const std::string &sessionId, const std::string &messageId, const std::string &partId);
     bool updatePart(const Part &part);
     bool deletePart(const std::string &sessionId, const std::string &messageId, const std::string &partId);

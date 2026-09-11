@@ -135,8 +135,8 @@ void MemoryManager::extractKnowledgeAsync(const std::string &text, const std::st
     // Knowledge extraction costs one extra LLM request per message; only run
     // it when the selected provider actually has embeddings configured.
     bool embeddingAvailable = isEmbeddingAvailable(providerId);
-    std::string availStr = embeddingAvailable ? "true" : "false";
-    LOG_INFO("[KnowledgeGraph] Checking embeddings: providerId=" + providerId + " available=" + availStr);
+    LOG_INFO("[KnowledgeGraph] Checking embeddings: providerId=" + providerId + 
+             " available=" + (embeddingAvailable ? "true" : "false"));
     if (!embeddingAvailable) return;
 
     // Run extraction in a detached thread (non-blocking)

@@ -21,8 +21,8 @@ json PermissionRequest::toJson() const
 
 // ---- PermissionManager ----
 
-PermissionManager::PermissionManager(Config &config, EventBus &events)
-    : m_config(config), m_events(events)
+PermissionManager::PermissionManager(Database &db, EventBus &events)
+    : m_db(db), m_events(events)
 {
 }
 
@@ -30,16 +30,12 @@ std::vector<PermissionRule> PermissionManager::loadRules() const
 {
     std::vector<PermissionRule> rules;
 
-    const json &data = m_config.data();
-    if (!data.contains("permissions") || !data["permissions"].is_array()) {
-        return rules;
-    }
-
-    for (const auto &item : data["permissions"]) {
+    auto rows = m_db.query("SELECT permission, pattern, action FROM permission_rule");
+    for (const auto &row : rows) {
         PermissionRule rule;
-        rule.permission = item.value("permission", "");
-        rule.pattern = item.value("pattern", "*");
-        rule.action = item.value("action", "ask");
+        rule.permission = row.value("permission", "");
+        rule.pattern = row.value("pattern", "*");
+        rule.action = row.value("action", "ask");
         if (!rule.permission.empty()) {
             rules.push_back(rule);
         }
@@ -174,7 +170,7 @@ bool PermissionManager::ask(const std::string &sessionId, const std::string &per
 
     case PermissionReply::Always: {
         LOG_INFO("Permission granted (always): " + req.id);
-        // Add dynamic allow rules
+        // Add dynamic allow rules (in-memory)
         std::lock_guard<std::mutex> lock(m_mutex);
         for (const auto &pattern : patterns) {
             PermissionRule rule;
@@ -182,6 +178,17 @@ bool PermissionManager::ask(const std::string &sessionId, const std::string &per
             rule.pattern = pattern;
             rule.action = "allow";
             m_dynamicRules.push_back(rule);
+        }
+        // Persist to SQLite so rules survive restarts
+        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        for (const auto &pattern : patterns) {
+            std::string ruleId = util::uuid4();
+            m_db.execute(
+                "INSERT INTO permission_rule (id, permission, pattern, action, time_created) "
+                "VALUES (?, ?, ?, 'allow', ?)",
+                {ruleId, permission, pattern, now}
+            );
         }
         return true;
     }

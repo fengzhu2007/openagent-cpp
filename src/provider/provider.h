@@ -13,6 +13,23 @@ struct ToolCall {
     json arguments;
 };
 
+// Parse accumulated tool-call argument text (opencode v1 parseToolInput
+// semantics): empty text means "no arguments" ({}), while non-empty text that
+// is not valid JSON is preserved as {raw: text} instead of failing the stream.
+inline json parseToolArguments(const std::string &arguments)
+{
+    if (arguments.empty()) return json::object();
+    try {
+        json parsed = json::parse(arguments);
+        // Tool arguments must be a JSON object; if the model produced an
+        // array or primitive, wrap it so downstream code can safely use
+        // operator[] / contains() with string keys.
+        if (!parsed.is_object()) return json::object({{"raw", parsed}});
+        return parsed;
+    }
+    catch (...) { return json::object({{"raw", arguments}}); }
+}
+
 // A single event from the LLM stream
 struct LLMEvent {
     enum Type {

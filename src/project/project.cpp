@@ -22,11 +22,11 @@ json ProjectInfo::toJson() const
     j["icon"] = json::object();
     if (!iconUrl.empty()) j["icon"]["url"] = iconUrl;
     if (!iconColor.empty()) j["icon"]["color"] = iconColor;
-    j["time"] = {
+    j["time"] = json::object({
         {"created", timeCreated},
         {"updated", timeUpdated},
         {"initialized", timeInitialized}
-    };
+    });
     try {
         j["sandboxes"] = json::parse(sandboxes);
     } catch (...) {

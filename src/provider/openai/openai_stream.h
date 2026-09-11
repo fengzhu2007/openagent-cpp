@@ -21,6 +21,7 @@ public:
 private:
     void processLine(const std::string &line);
     void parseDelta(const json &delta);
+    void flushPendingTools();
 
     EventCallback m_callback;
     std::string m_buffer;
@@ -31,6 +32,7 @@ private:
         std::string id;
         std::string name;
         std::string arguments;
+        bool startEmitted = false;
     };
     std::vector<PendingToolCall> m_pendingTools;
     bool m_textStarted = false;

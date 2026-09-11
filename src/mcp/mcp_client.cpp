@@ -241,12 +241,12 @@ json McpClient::sendRequest(const std::string &method, const json &params)
 {
     if (!m_connected) return json(nullptr);
 
-    json request = {
+    json request = json::object({
         {"jsonrpc", "2.0"},
         {"id", m_nextId++},
         {"method", method},
         {"params", params}
-    };
+    });
 
     if (!writeMessage(request)) {
         return json(nullptr);

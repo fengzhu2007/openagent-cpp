@@ -5,6 +5,7 @@
 #include <direct.h>
 #include <io.h>
 #include <sys/stat.h>
+#include <cstdio>
 #define F_OK 0
 #define S_IFREG _S_IFREG
 #else
@@ -26,7 +27,7 @@ json ReadTool::parameters() const
         {"properties", {
             {"path", {
                 {"type", "string"},
-                {"description", "The file path to read"}
+                {"description", "The absolute file path to read"}
             }},
             {"offset", {
                 {"type", "integer"},
@@ -41,9 +42,9 @@ json ReadTool::parameters() const
     };
 }
 
-ToolResult ReadTool::execute(const json &args)
+ToolResult ReadTool::execute(const json &args, const std::string &cwd)
 {
-    std::string path = args.value("path", "");
+    std::string path = resolvePath(cwd, args.value("path", ""));
     if (path.empty()) {
         return {false, "", "No file path specified", "read"};
     }
@@ -54,7 +55,7 @@ ToolResult ReadTool::execute(const json &args)
     // Check if file exists
 #ifdef _WIN32
     struct _stat st;
-    if (_stat(path.c_str(), &st) != 0) {
+    if (_wstat(utf8ToWide(path).c_str(), &st) != 0) {
 #else
     struct stat st;
     if (stat(path.c_str(), &st) != 0) {
@@ -67,10 +68,24 @@ ToolResult ReadTool::execute(const json &args)
         return {false, "", "Not a regular file: " + path, "read: " + path};
     }
 
+#ifdef _WIN32
+    FILE *fp = _wfopen(utf8ToWide(path).c_str(), L"rb");
+    if (!fp) {
+        return {false, "", "Failed to open file: " + path, "read: " + path};
+    }
+    fseek(fp, 0, SEEK_END);
+    long fileSize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    std::string fileContent(fileSize, '\0');
+    fread(&fileContent[0], 1, fileSize, fp);
+    fclose(fp);
+    std::istringstream file(fileContent);
+#else
     std::ifstream file(path);
     if (!file.is_open()) {
         return {false, "", "Failed to open file: " + path, "read: " + path};
     }
+#endif
 
     ToolResult result;
     result.title = "read: " + path;

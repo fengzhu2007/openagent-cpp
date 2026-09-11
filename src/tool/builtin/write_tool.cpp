@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #include <direct.h>
 #include <sys/stat.h>
+#include <cstdio>
 #else
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -21,7 +22,8 @@ static void createParentDirs(const std::string &path)
     // Check if parent exists
 #ifdef _WIN32
     struct _stat st;
-    if (_stat(parent.c_str(), &st) == 0) return;
+    std::wstring wParent = utf8ToWide(parent);
+    if (_wstat(wParent.c_str(), &st) == 0) return;
 #else
     struct stat st;
     if (stat(parent.c_str(), &st) == 0) return;
@@ -32,7 +34,7 @@ static void createParentDirs(const std::string &path)
 
     // Create this directory
 #ifdef _WIN32
-    _mkdir(parent.c_str());
+    _wmkdir(wParent.c_str());
 #else
     mkdir(parent.c_str(), 0755);
 #endif
@@ -51,7 +53,7 @@ json WriteTool::parameters() const
         {"properties", {
             {"path", {
                 {"type", "string"},
-                {"description", "The file path to write to"}
+                {"description", "The absolute file path to write to"}
             }},
             {"content", {
                 {"type", "string"},
@@ -66,9 +68,11 @@ json WriteTool::parameters() const
     };
 }
 
-ToolResult WriteTool::execute(const json &args)
+ToolResult WriteTool::execute(const json &args, const std::string &cwd)
 {
-    std::string path = args.value("path", "");
+    // Relative paths resolve against the session working directory, not the
+    // server process CWD (matching opencode's instance.directory behaviour).
+    std::string path = resolvePath(cwd, args.value("path", ""));
     std::string content = args.value("content", "");
     bool append = args.value("append", false);
 
@@ -80,18 +84,29 @@ ToolResult WriteTool::execute(const json &args)
     createParentDirs(path);
 
     // Open file in write or append mode
-    auto mode = append ? (std::ios::out | std::ios::app) : std::ios::out;
-    std::ofstream file(path, mode);
+#ifdef _WIN32
+    std::wstring wPath = utf8ToWide(path);
+    const wchar_t *wmode = append ? L"ab" : L"wb";
+    FILE *fp = _wfopen(wPath.c_str(), wmode);
+    if (!fp) {
+        return {false, "", "Failed to open file for writing: " + path, "write: " + path};
+    }
+    size_t written = fwrite(content.data(), 1, content.size(), fp);
+    fclose(fp);
+    if (written != content.size()) {
+        return {false, "", "Failed to write to file: " + path, "write: " + path};
+    }
+#else
+    std::ofstream file(path, append ? (std::ios::out | std::ios::app) : std::ios::out);
     if (!file.is_open()) {
         return {false, "", "Failed to open file for writing: " + path, "write: " + path};
     }
-
     file << content;
     file.close();
-
     if (file.fail()) {
         return {false, "", "Failed to write to file: " + path, "write: " + path};
     }
+#endif
 
     ToolResult result;
     result.success = true;

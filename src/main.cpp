@@ -10,12 +10,17 @@
 #include "provider/anthropic/anthropic_provider.h"
 #include "tool/tool_registry.h"
 #include "tool/builtin/shell_tool.h"
+#ifdef _WIN32
+#include "tool/builtin/cmd_tool.h"
+#include "tool/builtin/powershell_tool.h"
+#endif
 #include "tool/builtin/read_tool.h"
 #include "tool/builtin/write_tool.h"
 #include "tool/builtin/edit_tool.h"
 #include "tool/builtin/glob_tool.h"
 #include "tool/builtin/grep_tool.h"
 #include "server/server.h"
+#include "util/httplib_client.h"
 
 #include <iostream>
 #include <string>
@@ -45,7 +50,8 @@ static void printUsage(const char *prog)
               << "  --verbose            Shortcut for --log-level debug\n"
               << "  --config <path>      Path to config.json (default: ./config.json)\n"
               << "  --data-dir <path>    Directory for SQLite database (default: .)\n"
-              << "  --help               Show this help message\n";
+              << "  --proxy <url>        HTTP proxy for all outbound requests (e.g. http://127.0.0.1:7890)\n"
+              << "  --help               Show this help message  \n";
 }
 
 struct CliOptions {
@@ -55,6 +61,7 @@ struct CliOptions {
     std::string logFile;
     std::string configPath = "config.json";
     std::string dataDir = ".";
+    std::string proxy;
     bool showHelp = false;
 };
 
@@ -84,6 +91,8 @@ static CliOptions parseArgs(int argc, char *argv[])
             opts.configPath = nextArg();
         } else if (arg == "--data-dir") {
             opts.dataDir = nextArg();
+        } else if (arg == "--proxy") {
+            opts.proxy = nextArg();
         } else if (arg == "--help" || arg == "-h") {
             opts.showHelp = true;
         } else {
@@ -131,6 +140,11 @@ int main(int argc, char *argv[])
     config.set("port", opts.port);
     config.set("host", opts.host);
     config.set("data_dir", opts.dataDir);
+    if (!opts.proxy.empty()) {
+        config.set("proxy", opts.proxy);
+        HttpClient::setProxy(opts.proxy);
+        LOG_INFO("Using proxy: " + opts.proxy);
+    }
 
     // Initialize database
     std::string dbPath = opts.dataDir + "/opencode.db";
@@ -199,7 +213,15 @@ int main(int argc, char *argv[])
     // Initialize tool registry and register built-in tools
     LOG_INFO("Initializing tools...");
     ToolRegistry toolRegistry;
+    // Register shell tools based on platform:
+    // Windows: cmd + powershell (dedicated tools for each shell)
+    // Linux:   shell (generic /bin/sh wrapper)
+#ifdef _WIN32
+    toolRegistry.registerTool(std::make_unique<CmdTool>());
+    toolRegistry.registerTool(std::make_unique<PowerShellTool>());
+#else
     toolRegistry.registerTool(std::make_unique<ShellTool>());
+#endif
     toolRegistry.registerTool(std::make_unique<ReadTool>());
     toolRegistry.registerTool(std::make_unique<WriteTool>());
     toolRegistry.registerTool(std::make_unique<EditTool>());

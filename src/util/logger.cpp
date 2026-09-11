@@ -5,13 +5,24 @@
 #include <sstream>
 #include <algorithm>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 Logger &Logger::instance()
 {
     static Logger inst;
     return inst;
 }
 
-Logger::Logger() = default;
+Logger::Logger()
+{
+#ifdef _WIN32
+    // Set console output code page to UTF-8 so that ConPTY / CMD / terminal
+    // emulators correctly interpret UTF-8 bytes written to stdout.
+    SetConsoleOutputCP(CP_UTF8);
+#endif
+}
 
 Logger::~Logger()
 {

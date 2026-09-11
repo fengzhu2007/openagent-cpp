@@ -115,10 +115,14 @@ bool GrepTool::matchesInclude(const std::string &pattern, const std::string &fil
     return pi == pattern.size();
 }
 
-ToolResult GrepTool::execute(const json &args)
+ToolResult GrepTool::execute(const json &args, const std::string &cwd)
 {
     std::string pattern = args.value("pattern", "");
     std::string basePath = args.value("path", ".");
+    // Default "." means the session working directory; relative paths
+    // resolve against it, never against the server process CWD.
+    if (basePath == "." || basePath.empty()) basePath = cwd.empty() ? "." : cwd;
+    else basePath = resolvePath(cwd, basePath);
     std::string include = args.value("include", "");
 
     if (pattern.empty()) {

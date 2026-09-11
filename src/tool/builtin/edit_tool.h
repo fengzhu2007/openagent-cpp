@@ -8,7 +8,7 @@ public:
     std::string name() const override { return "edit"; }
     std::string description() const override;
     json parameters() const override;
-    ToolResult execute(const json &args) override;
+    ToolResult execute(const json &args, const std::string &cwd) override;
 
 private:
     // Generate unified diff between old and new content

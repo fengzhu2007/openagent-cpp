@@ -1,5 +1,5 @@
 #pragma once
-#include "config/config.h"
+#include "database/database.h"
 #include "event/event_bus.h"
 #include "json.hpp"
 #include <string>
@@ -46,7 +46,7 @@ enum class PermissionReply {
 // Permission manager: evaluates rules, manages deferred requests
 class PermissionManager {
 public:
-    PermissionManager(Config &config, EventBus &events);
+    PermissionManager(Database &db, EventBus &events);
 
     // Evaluate a permission request.
     // Returns true if allowed, false if denied.
@@ -76,7 +76,7 @@ private:
     // Simple glob pattern matching
     static bool matchPattern(const std::string &pattern, const std::string &value);
 
-    Config &m_config;
+    Database &m_db;
     EventBus &m_events;
 
     mutable std::mutex m_mutex;

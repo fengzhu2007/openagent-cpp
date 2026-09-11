@@ -151,6 +151,17 @@ void Schema::migrate(Database &db)
         );
     )");
 
+    // Permission rules (persisted "Allow Always" decisions)
+    db.exec(R"(
+        CREATE TABLE IF NOT EXISTS permission_rule (
+            id          TEXT PRIMARY KEY,
+            permission  TEXT NOT NULL,
+            pattern     TEXT NOT NULL,
+            action      TEXT NOT NULL DEFAULT 'allow',
+            time_created INTEGER NOT NULL
+        );
+    )");
+
     // Indexes
     db.exec("CREATE INDEX IF NOT EXISTS idx_message_session ON message(session_id, time_created);");
     db.exec("CREATE INDEX IF NOT EXISTS idx_part_message ON part(message_id);");
@@ -167,6 +178,7 @@ void Schema::migrate(Database &db)
     db.exec("CREATE INDEX IF NOT EXISTS idx_kg_scope ON knowledge_triple(scope);");
     db.exec("CREATE INDEX IF NOT EXISTS idx_kg_subject ON knowledge_triple(subject, scope);");
     db.exec("CREATE INDEX IF NOT EXISTS idx_kg_object ON knowledge_triple(object, scope);");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_perm_rule_perm ON permission_rule(permission);");
 
     // Migration: add embedding column to existing memory tables (skip if already exists)
     auto cols = db.query("PRAGMA table_info(memory)");

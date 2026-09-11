@@ -56,5 +56,12 @@ struct Message {
 // Helper: build a user message with a text part
 Message makeUserMessage(const std::string &sessionId, const std::string &content);
 
+// Helper: build a user message from opencode v1 input parts (text/file).
+// Text parts are concatenated into the fallback content; file parts are
+// kept as FilePart records. Falls back to a single text part when the
+// array is empty.
+Message makeUserMessageWithParts(const std::string &sessionId, const std::string &fallbackText,
+                                 const json &inputParts);
+
 // Helper: build an empty assistant message (to be filled by LLM stream)
 Message makeAssistantMessage(const std::string &sessionId, const std::string &model, const std::string &providerId);

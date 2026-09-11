@@ -3,10 +3,14 @@
 #include "session/retry.h"
 #include "provider/cost.h"
 #include "tool/truncate.h"
+#include "tool/builtin/shell_common.h"
 #include "util/uuid.h"
 #include "util/logger.h"
 #include <unordered_set>
+#include <algorithm>
+#include <sstream>
 #include <stdexcept>
+#include <cctype>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -78,7 +82,13 @@ SessionPrompt::SessionPrompt(SessionManager &sessionMgr, ProviderRegistry &provi
 {
 }
 
-void SessionPrompt::prompt(const std::string &sessionId, const std::string &userText)
+void SessionPrompt::setWorkingDirsGetter(std::function<std::vector<std::string>()> getter)
+{
+    m_workingDirsGetter = std::move(getter);
+}
+
+void SessionPrompt::prompt(const std::string &sessionId, const std::string &userText,
+                           const json &inputParts)
 {
     // Initialize abort flag so abort() can find it during sync execution
     {
@@ -86,7 +96,7 @@ void SessionPrompt::prompt(const std::string &sessionId, const std::string &user
         m_abortFlags[sessionId] = false;
     }
     try {
-        runPrompt(sessionId, userText);
+        runPrompt(sessionId, userText, inputParts);
     } catch (...) {
         std::lock_guard<std::mutex> lock(m_threadsMutex);
         m_abortFlags.erase(sessionId);
@@ -96,7 +106,8 @@ void SessionPrompt::prompt(const std::string &sessionId, const std::string &user
     m_abortFlags.erase(sessionId);
 }
 
-void SessionPrompt::promptAsync(const std::string &sessionId, const std::string &userText)
+void SessionPrompt::promptAsync(const std::string &sessionId, const std::string &userText,
+                                 const json &inputParts)
 {
     std::lock_guard<std::mutex> lock(m_threadsMutex);
 
@@ -110,9 +121,9 @@ void SessionPrompt::promptAsync(const std::string &sessionId, const std::string 
     m_abortFlags[sessionId] = false;
 
     // Spawn thread
-    m_threads.emplace(sessionId, std::thread([this, sessionId, userText]() {
+    m_threads.emplace(sessionId, std::thread([this, sessionId, userText, inputParts]() {
         try {
-            runPrompt(sessionId, userText);
+            runPrompt(sessionId, userText, inputParts);
         } catch (const std::exception &e) {
             std::string errMsg = sanitizeUtf8(e.what());
             LOG_ERROR("Prompt error for session " + sessionId + ": " + errMsg);
@@ -157,7 +168,8 @@ std::string SessionPrompt::buildSystemPrompt(const SessionInfo &session)
             return agent->systemPrompt;
         }
     }
-    std::string prompt = SystemPrompt::build(session.model, session.providerId, session.directory, m_config);
+    std::string prompt = SystemPrompt::build(session.model, session.providerId, session.directory, m_config,
+                                              m_workingDirsGetter ? m_workingDirsGetter() : std::vector<std::string>{});
 
     // Inject memory context if available
     if (m_memory) {
@@ -201,12 +213,44 @@ std::vector<ChatMessage> SessionPrompt::buildChatMessages(const std::string &ses
         }
 
         if (msg.role == MessageRole::User) {
+            // Compaction markers are transcript-only annotations with no text;
+            // replaying them would send an empty user message to the provider
+            bool compactionMarker = false;
+            for (const auto &part : msg.parts) {
+                if (part.type == "compaction") { compactionMarker = true; break; }
+            }
+            if (compactionMarker) continue;
+
             ChatMessage cm;
             cm.role = "user";
             for (const auto &part : msg.parts) {
                 if (part.type == "text" && part.data.contains("text")) {
                     if (!cm.content.empty()) cm.content += "\n";
                     cm.content += part.data["text"].get<std::string>();
+                } else if (part.type == "file") {
+                    // Providers here are text-only; surface the attachment as a
+                    // text annotation so the model at least knows a file was shared
+                    std::string label = part.data.value("filename", "");
+                    if (label.empty()) label = part.data.value("mime", "");
+                    if (!label.empty()) {
+                        if (!cm.content.empty()) cm.content += "\n";
+                        cm.content += "[Attachment: " + label + "]";
+                    }
+                } else if (part.type == "subtask") {
+                    // v1 SubtaskPart: the sub-agent's prompt is the replayable text
+                    std::string t = part.data.value("prompt", "");
+                    if (!t.empty()) {
+                        if (!cm.content.empty()) cm.content += "\n";
+                        cm.content += t;
+                    }
+                } else if (part.type == "agent") {
+                    // v1 AgentPart: keep the steering visible to the model as a
+                    // text annotation (agent routing itself is not server-side)
+                    std::string name = part.data.value("name", "");
+                    if (!name.empty()) {
+                        if (!cm.content.empty()) cm.content += "\n";
+                        cm.content += "[Agent: " + name + "]";
+                    }
                 }
             }
             if (cm.content.empty() && msg.data.contains("content")) {
@@ -222,14 +266,36 @@ std::vector<ChatMessage> SessionPrompt::buildChatMessages(const std::string &ses
             std::string textContent;
             std::vector<ToolCall> toolCalls;
 
-            for (const auto &part : msg.parts) {
+            // Replay rules (matching opencode v1):
+            // - a tool part without a callID can never be matched to a tool
+            //   result, so it is dropped instead of being sent to the API;
+            // - when the same callID appears more than once (gateways like
+            //   DeepSeek re-issue an id on a later round), only the latest
+            //   occurrence is replayed;
+            // - a call without a recorded result gets a synthesized error
+            //   result, because providers require every tool call to be
+            //   answered.
+            std::unordered_map<std::string, size_t> lastToolPartForCall;
+            for (size_t i = 0; i < msg.parts.size(); ++i) {
+                const auto &part = msg.parts[i];
+                if (part.type != "tool" && part.type != "tool-call") continue;
+                std::string callId = part.type == "tool"
+                    ? part.data.value("callID", "")
+                    : part.data.value("toolCallID", "");
+                if (!callId.empty()) lastToolPartForCall[callId] = i;
+            }
+
+            for (size_t i = 0; i < msg.parts.size(); ++i) {
+                const auto &part = msg.parts[i];
                 if (part.type == "text" && part.data.contains("text")) {
                     textContent += part.data["text"].get<std::string>();
                 } else if (part.type == "tool") {
                     // Opencode format: {callID, tool, state: {input}}
+                    std::string callId = part.data.value("callID", "");
+                    if (callId.empty() || lastToolPartForCall[callId] != i) continue;
                     hasToolCalls = true;
                     ToolCall tc;
-                    tc.id = part.data.value("callID", "");
+                    tc.id = callId;
                     tc.name = part.data.value("tool", "");
                     if (part.data.contains("state") && part.data["state"].is_object()) {
                         auto &state = part.data["state"];
@@ -244,9 +310,11 @@ std::vector<ChatMessage> SessionPrompt::buildChatMessages(const std::string &ses
                     toolCalls.push_back(tc);
                 } else if (part.type == "tool-call") {
                     // Legacy format: {toolCallID, name, arguments}
+                    std::string callId = part.data.value("toolCallID", "");
+                    if (callId.empty() || lastToolPartForCall[callId] != i) continue;
                     hasToolCalls = true;
                     ToolCall tc;
-                    tc.id = part.data.value("toolCallID", "");
+                    tc.id = callId;
                     tc.name = part.data.value("name", "");
                     try {
                         tc.arguments = json::parse(part.data.value("arguments", "{}"));
@@ -266,14 +334,28 @@ std::vector<ChatMessage> SessionPrompt::buildChatMessages(const std::string &ses
 
             // If there are tool calls, also add the tool result messages
             if (hasToolCalls) {
+                // Latest result per callID, mirroring the tool part dedup above
+                std::unordered_map<std::string, std::string> resultForCall;
                 for (const auto &part : msg.parts) {
-                    if (part.type == "tool-result") {
-                        ChatMessage toolMsg;
-                        toolMsg.role = "tool";
-                        toolMsg.toolCallId = part.data.value("toolCallID", "");
-                        toolMsg.content = part.data.value("output", "");
-                        chatMessages.push_back(toolMsg);
+                    if (part.type != "tool-result") continue;
+                    std::string callId = part.data.value("toolCallID", "");
+                    if (callId.empty()) continue;
+                    std::string output = part.data.value("output", "");
+                    if (output.empty()) {
+                        std::string err = part.data.value("error", "");
+                        if (!err.empty()) output = "Error: " + err;
                     }
+                    resultForCall[callId] = output;
+                }
+                for (const auto &tc : toolCalls) {
+                    ChatMessage toolMsg;
+                    toolMsg.role = "tool";
+                    toolMsg.toolCallId = tc.id;
+                    auto it = resultForCall.find(tc.id);
+                    toolMsg.content = it != resultForCall.end()
+                        ? it->second
+                        : "Error: [Tool execution was interrupted]";
+                    chatMessages.push_back(toolMsg);
                 }
             }
         }
@@ -310,7 +392,34 @@ Provider *SessionPrompt::resolveProvider(const SessionInfo &session, std::string
     return p;
 }
 
-ToolResult SessionPrompt::executeToolCall(const ToolCall &tc)
+// Windows-tolerant path key for permission boundary checks: unify separators
+// and fold case on Windows (paths are case-insensitive there), so an absolute
+// path coming from the LLM matches the working directories no matter how it
+// is spelled ("D:\\proj" vs "d:/proj").
+static std::string normalizePathKey(std::string p)
+{
+    for (auto &c : p) {
+        if (c == '\\') c = '/';
+#ifdef _WIN32
+        c = (char)tolower((unsigned char)c);
+#endif
+    }
+    return p;
+}
+
+// Component-boundary prefix test (like opencode's FSUtil.contains): the target
+// must extend the directory at a separator, never through a sibling whose name
+// merely shares the prefix (e.g. "anycode" must not match "anycode_backup").
+static bool pathContains(const std::string &dirKey, const std::string &targetKey)
+{
+    if (targetKey.size() < dirKey.size()) return false;
+    if (targetKey.compare(0, dirKey.size(), dirKey) != 0) return false;
+    if (targetKey.size() == dirKey.size()) return true;
+    return dirKey.back() == '/' || targetKey[dirKey.size()] == '/';
+}
+
+ToolResult SessionPrompt::executeToolCall(const std::string &sessionId, const std::string &sessionDir,
+                                           const ToolCall &tc)
 {
     Tool *tool = m_tools.getTool(tc.name);
     if (!tool) {
@@ -321,20 +430,96 @@ ToolResult SessionPrompt::executeToolCall(const ToolCall &tc)
         return r;
     }
 
+    // Working directory for the tool: the session directory when known,
+    // otherwise the first global working directory. Matches opencode, where
+    // tools resolve relative paths against instance.directory. "." is the
+    // request/DB default meaning "not set" — treating it as set would pin
+    // relative paths to the server process CWD (the exe directory).
+    std::string toolCwd = sessionDir;
+    if ((toolCwd.empty() || toolCwd == ".") && m_workingDirsGetter) {
+        auto dirs = m_workingDirsGetter();
+        if (!dirs.empty()) toolCwd = dirs[0];
+    }
+
+    // Resolve relative "path" arguments so the permission check below and the
+    // tool itself see the same absolute target (tools resolve idempotently).
+    json args = tc.arguments;
+    // Guard: some models may return arguments as a JSON array or primitive
+    // instead of an object; contains()/operator[] with a string key only
+    // works on objects, so normalise to {} when the shape is unexpected.
+    if (!args.is_object()) {
+        LOG_WARN("Tool arguments for '" + tc.name + "' are not a JSON object (type="
+                 + std::to_string(static_cast<int>(args.type())) + "), wrapping as {raw: ...}");
+        args = json::object({{"raw", tc.arguments.dump()}});
+    }
+    if (!toolCwd.empty() && args.contains("path") && args["path"].is_string()) {
+        args["path"] = resolvePath(toolCwd, args["path"].get<std::string>());
+    }
+
+    // Skip permission check for read-only tools
+    static const std::vector<std::string> readOnlyTools = {
+        "glob", "read", "list", "search", "grep", "fetch"
+    };
+    bool isReadOnly = std::find(readOnlyTools.begin(), readOnlyTools.end(), tc.name)
+                      != readOnlyTools.end();
+
     // Permission check before tool execution
-    if (m_permission) {
+    if (m_permission && !isReadOnly) {
         // Build patterns from tool arguments
         std::vector<std::string> patterns;
-        if (tc.name == "shell" && tc.arguments.contains("command")) {
-            patterns.push_back(tc.arguments["command"].get<std::string>());
-        } else if ((tc.name == "write" || tc.name == "edit") && tc.arguments.contains("path")) {
-            patterns.push_back(tc.arguments["path"].get<std::string>());
+        std::string targetPath;
+        if (isShellTool(tc.name) && args.contains("command")) {
+            std::string cmd = args["command"].get<std::string>();
+            // Extract the command name (first token) as the matching pattern.
+            // This way "Allow Always" for "ls" covers all ls invocations.
+            std::string cmdName = cmd;
+            auto sp = cmd.find(' ');
+            if (sp != std::string::npos) cmdName = cmd.substr(0, sp);
+            // Also strip path prefix: "/usr/bin/ls" -> "ls"
+            auto slash = cmdName.find_last_of("/\\");
+            if (slash != std::string::npos) cmdName = cmdName.substr(slash + 1);
+            patterns.push_back(cmdName);
+        } else if ((tc.name == "write" || tc.name == "edit") && args.contains("path")) {
+            targetPath = args["path"].get<std::string>();
+            patterns.push_back(targetPath);
         } else {
             patterns.push_back("*");
         }
 
-        json metadata = {{"tool", tc.name}, {"arguments", tc.arguments}};
-        bool allowed = m_permission->ask("", tc.name, patterns, tc.name, metadata);
+        // Auto-allow operations within the project directory
+        bool inProjectDir = false;
+        LOG_DEBUG("Permission check: tool=" + tc.name + " sessionDir=" + sessionDir + " patterns=" + (patterns.empty() ? "*" : patterns[0]));
+        
+        // Build list of directories to check against
+        std::vector<std::string> checkDirs = m_workingDirsGetter ? m_workingDirsGetter() : std::vector<std::string>{};
+        if (checkDirs.empty() && !sessionDir.empty()) {
+            checkDirs.push_back(sessionDir);
+        }
+        
+        if (!checkDirs.empty()) {
+            if (isShellTool(tc.name)) {
+                // Shell commands execute in the session's working directory,
+                // so if a project directory is set, auto-allow.
+                inProjectDir = true;
+            } else if (!targetPath.empty()) {
+                // File operations: check if target path is within any of the
+                // working directories. Comparison is separator- and (on
+                // Windows) case-insensitive so absolute paths from the LLM
+                // match however they are spelled; the component-boundary test
+                // keeps sibling directories outside the allowed range.
+                std::string targetKey = normalizePathKey(targetPath);
+                for (const auto &dir : checkDirs) {
+                    std::string dirKey = normalizePathKey(dir);
+                    if (!dirKey.empty() && dirKey.back() != '/') dirKey += '/';
+                    if (pathContains(dirKey, targetKey)) {
+                        inProjectDir = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        bool allowed = inProjectDir || m_permission->ask(sessionId, tc.name, patterns, tc.name, {{"tool", tc.name}, {"arguments", args}});
         if (!allowed) {
             ToolResult r;
             r.success = false;
@@ -346,7 +531,7 @@ ToolResult SessionPrompt::executeToolCall(const ToolCall &tc)
 
     LOG_INFO("Executing tool: " + tc.name);
     try {
-        ToolResult result = tool->execute(tc.arguments);
+        ToolResult result = tool->execute(args, toolCwd);
 
         // Truncate large tool outputs
         std::string dataDir = m_config.getString("data_dir", ".");
@@ -445,11 +630,11 @@ bool SessionPrompt::checkAndCompact(std::vector<ChatMessage> &chatHistory, Provi
     chatHistory = std::move(newHistory);
 
     // Publish compaction event
-    m_events.publish(EventType::SessionUpdated, {
+    m_events.publish(EventType::SessionUpdated, json::object({
         {"sessionID", sessionId},
         {"compacted", true},
         {"summaryLength", static_cast<int>(summary.size())}
-    });
+    }));
 
     LOG_INFO("Compaction complete. New history: " + std::to_string(chatHistory.size()) + " messages");
     return true;
@@ -517,7 +702,139 @@ void SessionPrompt::generateTitleAsync(const std::string &sessionId, Provider *p
     t.detach();
 }
 
-bool SessionPrompt::processLLMRound(const std::string &sessionId, Message &assistantMsg,
+// ---- Memory extraction ----
+
+std::string SessionPrompt::buildMemoryExtractPrompt(
+    const std::vector<ChatMessage> &chatHistory,
+    const std::string &projectId)
+{
+    // Load extraction prompt template from prompts/memory-extract.txt
+    std::string templateText = SystemPrompt::loadPromptText("memory-extract.txt");
+    if (templateText.empty()) {
+        LOG_WARN("prompts/memory-extract.txt not found, using fallback");
+        templateText = "You are a memory extraction module. Analyze the conversation and extract "
+                       "information worth remembering. Output a JSON array of {\"type\", \"content\", "
+                       "\"keywords\"} objects. If nothing is worth remembering, output [].\n\n"
+                       "## Conversation history\n";
+    }
+
+    std::ostringstream ss;
+    ss << templateText;
+
+    // Include recent conversation (last 20 messages to stay within token limits)
+    size_t start = chatHistory.size() > 20 ? chatHistory.size() - 20 : 0;
+    for (size_t i = start; i < chatHistory.size(); ++i) {
+        const auto &msg = chatHistory[i];
+        ss << msg.role << ": ";
+        if (msg.content.size() > 500) {
+            ss << msg.content.substr(0, 500) << "...";
+        } else {
+            ss << msg.content;
+        }
+        ss << "\n";
+    }
+
+    return ss.str();
+}
+
+void SessionPrompt::triggerMemoryExtraction(
+    const std::string &sessionId,
+    const std::string &projectId,
+    Provider *provider,
+    const std::string &model,
+    const std::vector<ChatMessage> &chatHistory)
+{
+    if (!m_memory || projectId.empty() || !provider) return;
+
+    std::string extractPrompt = buildMemoryExtractPrompt(chatHistory, projectId);
+
+    std::thread t([this, sessionId, projectId, provider, model, extractPrompt]() {
+        try {
+            LLMRequest request;
+            request.model = model;
+            request.messages = {
+                {"system", extractPrompt, {}, ""}
+            };
+            request.stream = false;
+            request.temperature = 0.3;
+            request.maxTokens = 512;
+
+            json response = provider->chat(request);
+
+            std::string text;
+            if (response.contains("choices") && response["choices"].is_array() &&
+                !response["choices"].empty()) {
+                text = response["choices"][0]["message"]["content"].get<std::string>();
+            }
+
+            if (text.empty()) return;
+
+            // Strip think tags if present
+            auto thinkStart = text.find("<think>");
+            while (thinkStart != std::string::npos) {
+                auto thinkEnd = text.find("</think>", thinkStart);
+                if (thinkEnd != std::string::npos) {
+                    text.erase(thinkStart, thinkEnd - thinkStart + 8);
+                } else {
+                    text.erase(thinkStart);
+                }
+                thinkStart = text.find("<think>");
+            }
+
+            // Extract JSON array from response
+            auto arrStart = text.find('[');
+            auto arrEnd = text.rfind(']');
+            if (arrStart == std::string::npos || arrEnd == std::string::npos ||
+                arrEnd <= arrStart) {
+                LOG_INFO("Memory extraction: no JSON array found in response");
+                return;
+            }
+
+            std::string jsonStr = text.substr(arrStart, arrEnd - arrStart + 1);
+            auto parsed = json::parse(jsonStr, nullptr, false);
+            if (!parsed.is_array() || parsed.empty()) {
+                LOG_INFO("Memory extraction: empty or invalid JSON array");
+                return;
+            }
+
+            std::string scope = "project:" + projectId;
+            int savedCount = 0;
+
+            for (const auto &mem : parsed) {
+                std::string type = mem.value("type", "fact");
+                std::string content = mem.value("content", "");
+                std::string keywords = mem.value("keywords", "");
+
+                if (content.empty()) continue;
+
+                MemoryEntry entry = m_memory->addMemory(type, content, scope, keywords);
+
+                // Publish event to notify IDE
+                m_events.publish(EventType::MemoryCreated, {
+                    {"id", entry.id},
+                    {"type", type},
+                    {"content", content},
+                    {"scope", scope},
+                    {"keywords", keywords},
+                    {"sessionID", sessionId}
+                });
+
+                ++savedCount;
+            }
+
+            if (savedCount > 0) {
+                LOG_INFO("Memory extraction: saved " + std::to_string(savedCount) +
+                         " memories for project " + projectId);
+            }
+        } catch (const std::exception &e) {
+            LOG_WARN("Memory extraction failed: " + std::string(e.what()));
+        }
+    });
+    t.detach();
+}
+
+bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::string &sessionDir,
+                                     Message &assistantMsg,
                                      Provider *provider, const std::string &model,
                                      const Config::ModelConfig &modelCfg,
                                      std::vector<ChatMessage> &chatHistory)
@@ -556,35 +873,117 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, Message &assis
         }
     }
 
+    // Announce the step boundary (v1 semantics: every provider turn starts
+    // with a step-start part; the snapshot hash marks the pre-turn state)
+    {
+        Part stepStartPart;
+        stepStartPart.id = util::uuid4();
+        stepStartPart.messageId = assistantMsg.id;
+        stepStartPart.sessionId = sessionId;
+        stepStartPart.type = "step-start";
+        if (!snapshotHash.empty()) stepStartPart.data["snapshot"] = snapshotHash;
+        stepStartPart.timeCreated = util::nowMs();
+        stepStartPart.timeUpdated = stepStartPart.timeCreated;
+        m_sessionMgr.addPart(stepStartPart);
+    }
+
     // State for this round
     std::string accumulatedText;
     std::vector<ToolCall> toolCalls;
     bool hasToolCalls = false;
 
+    // Tool parts created in this round, keyed by callID. Execution updates
+    // these directly so a callID the model re-issues in a later round can
+    // never re-publish an older part that shares the id.
+    std::unordered_map<std::string, Part> toolParts;
+
     // Current text part being accumulated
     Part currentTextPart;
     bool textPartCreated = false;
 
+    // Current reasoning part being accumulated; the part is created lazily on
+    // the first delta (the provider layer has no reasoning-start event) and
+    // persisted when the step finishes.
+    Part currentReasoningPart;
+    bool reasoningPartCreated = false;
+    std::string accumulatedReasoning;
+
+    // Last step-finish part of this round. The completed snapshot (v1: taken
+    // after the step's tools ran) is stamped onto it in recordStepEndState.
+    Part lastStepFinishPart;
+    bool stepFinishCreated = false;
+
     // Retry loop for transient errors
     SessionRetry::Config retryCfg;
     bool streamCompleted = false;
+    std::string lastError;  // message of the most recent failed attempt
 
     for (int attempt = 0; attempt <= retryCfg.maxRetries && !streamCompleted; ++attempt) {
         if (attempt > 0) {
             LOG_WARN("Retrying LLM stream, attempt " + std::to_string(attempt) +
                      "/" + std::to_string(retryCfg.maxRetries));
+
+            // Record the failed attempt (v1 RetryPart) so the transcript shows
+            // why the step re-ran
+            {
+                Part retryPart;
+                retryPart.id = util::uuid4();
+                retryPart.messageId = assistantMsg.id;
+                retryPart.sessionId = sessionId;
+                retryPart.type = "retry";
+                retryPart.data = json::object({
+                    {"attempt", attempt},
+                    {"error", json::object({
+                        {"name", "APIError"},
+                        {"data", json::object({
+                            {"message", lastError},
+                            {"isRetryable", true}
+                        })}
+                    })}
+                });
+                retryPart.timeCreated = util::nowMs();
+                retryPart.timeUpdated = retryPart.timeCreated;
+                m_sessionMgr.addPart(retryPart);
+            }
+
+            // The retried stream re-fires step-start in v1; mirror that here
+            {
+                Part stepStartPart;
+                stepStartPart.id = util::uuid4();
+                stepStartPart.messageId = assistantMsg.id;
+                stepStartPart.sessionId = sessionId;
+                stepStartPart.type = "step-start";
+                if (!snapshotHash.empty()) stepStartPart.data["snapshot"] = snapshotHash;
+                stepStartPart.timeCreated = util::nowMs();
+                stepStartPart.timeUpdated = stepStartPart.timeCreated;
+                m_sessionMgr.addPart(stepStartPart);
+            }
+
             SessionRetry::sleepForAttempt(attempt, retryCfg);
-            // Reset state for retry
+
+            // Finalize tool parts left pending by the failed attempt so the
+            // retry never leaves orphan parts (their results can never arrive)
+            finalizeInterruptedToolParts(sessionId, assistantMsg.id);
+
+            // Reset state for retry. Parts already created in this round
+            // (text/reasoning/tool) keep their ids and are reused by the next
+            // attempt, so a retry never leaves orphan parts behind; only the
+            // accumulated content is discarded.
             accumulatedText.clear();
             toolCalls.clear();
             hasToolCalls = false;
-            textPartCreated = false;
-            currentTextPart = Part{};
+            toolParts.clear();
+            accumulatedReasoning.clear();
+            stepFinishCreated = false;
+            lastStepFinishPart = Part{};
         }
 
         try {
-            LOG_INFO("[processLLMRound] calling provider->stream()");
+            LOG_INFO("[processLLMRound] calling provider->stream() model=" + model + " messages=" + std::to_string(request.messages.size()));
+            int eventCount = 0;
             provider->stream(request, [&](const LLMEvent &event) {
+            ++eventCount;
+            LOG_INFO("[LLM] event #" + std::to_string(eventCount) + " type=" + std::to_string(event.type));
         switch (event.type) {
         case LLMEvent::TextStart:
             // Start a new text part
@@ -598,6 +997,11 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, Message &assis
                 currentTextPart.timeCreated = util::nowMs();
                 currentTextPart.timeUpdated = currentTextPart.timeCreated;
                 textPartCreated = true;
+                // Persist and publish the (still empty) part right away so
+                // clients learn the partID → "text" mapping before the first
+                // message.part.delta arrives (opencode v1 semantics: parts are
+                // announced at start, not at end)
+                m_sessionMgr.addPart(currentTextPart);
             }
             break;
 
@@ -623,18 +1027,21 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, Message &assis
             if (textPartCreated) {
                 currentTextPart.data["text"] = accumulatedText;
                 currentTextPart.timeUpdated = util::nowMs();
-                m_sessionMgr.addPart(currentTextPart);
-                m_events.publish(EventType::PartUpdated, {
-                    {"sessionID", sessionId},
-                    {"part", currentTextPart.toJson()},
-                    {"time", util::nowMs()}
-                });
+                // Part was persisted at TextStart; update it with the full text
+                m_sessionMgr.updatePart(currentTextPart);
             }
             break;
 
         case LLMEvent::ToolCallStart:
         case LLMEvent::ToolCallEnd:
             if (event.type == LLMEvent::ToolCallEnd) {
+                // Drop calls without an id: they can never be matched to a
+                // tool result, would fail API replay (empty tool_call id)
+                // and would show up as unusable parts in the UI
+                if (event.toolCall.id.empty()) {
+                    LOG_WARN("Dropping tool call without id: " + event.toolCall.name);
+                    break;
+                }
                 toolCalls.push_back(event.toolCall);
                 hasToolCalls = true;
 
@@ -644,25 +1051,23 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, Message &assis
                 toolPart.messageId = assistantMsg.id;
                 toolPart.sessionId = sessionId;
                 toolPart.type = "tool";
-                // Parse arguments: if string, try to parse as JSON
-                json input;
-                if (event.toolCall.arguments.is_string()) {
-                    try { input = json::parse(event.toolCall.arguments.get<std::string>()); }
-                    catch (...) { input = {{"raw", event.toolCall.arguments.get<std::string>()}}; }
-                } else {
-                    input = event.toolCall.arguments;
-                }
-                toolPart.data = {
+                // Arguments normally arrive pre-parsed from the stream
+                // parser; guard against raw string payloads anyway
+                json input = event.toolCall.arguments.is_string()
+                    ? parseToolArguments(event.toolCall.arguments.get<std::string>())
+                    : event.toolCall.arguments;
+                toolPart.data = json::object({
                     {"callID", event.toolCall.id},
                     {"tool", event.toolCall.name},
-                    {"state", {
+                    {"state", json::object({
                         {"status", "pending"},
                         {"input", input}
-                    }}
-                };
+                    })}
+                });
                 toolPart.timeCreated = util::nowMs();
                 toolPart.timeUpdated = toolPart.timeCreated;
                 m_sessionMgr.addPart(toolPart);
+                toolParts[event.toolCall.id] = toolPart;
 
                 LOG_INFO("Tool call received: " + event.toolCall.name +
                          " (id=" + event.toolCall.id + ")");
@@ -670,16 +1075,47 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, Message &assis
             break;
 
         case LLMEvent::ReasoningDelta:
-            // Publish reasoning delta for SSE streaming
+            // Align with opencode: reasoning streams as a regular part whose
+            // delta event is shaped exactly like a text delta
+            // ({sessionID, messageID, partID, field, delta}).
+            if (!reasoningPartCreated) {
+                currentReasoningPart.id = util::uuid4();
+                currentReasoningPart.messageId = assistantMsg.id;
+                currentReasoningPart.sessionId = sessionId;
+                currentReasoningPart.type = "reasoning";
+                currentReasoningPart.data = {{"text", ""}};
+                currentReasoningPart.timeCreated = util::nowMs();
+                currentReasoningPart.timeUpdated = currentReasoningPart.timeCreated;
+                reasoningPartCreated = true;
+                // Persist and publish the (still empty) part right away so
+                // clients learn the partID → "reasoning" mapping before the
+                // first delta arrives; otherwise reasoning deltas are
+                // indistinguishable from text deltas on the wire
+                m_sessionMgr.addPart(currentReasoningPart);
+            }
+            accumulatedReasoning += event.text;
+            currentReasoningPart.data["text"] = accumulatedReasoning;
+            currentReasoningPart.timeUpdated = util::nowMs();
             m_events.publish(EventType::PartDelta, {
                 {"sessionID", sessionId},
                 {"messageID", assistantMsg.id},
-                {"type", "reasoning"},
-                {"text", event.text}
+                {"partID", currentReasoningPart.id},
+                {"field", "text"},
+                {"delta", event.text}
             });
             break;
 
         case LLMEvent::StepFinish:
+            // Persist the reasoning accumulated during this step (there is no
+            // explicit reasoning-end event from the provider)
+            if (reasoningPartCreated) {
+                currentReasoningPart.data["text"] = accumulatedReasoning;
+                currentReasoningPart.timeUpdated = util::nowMs();
+                m_sessionMgr.updatePart(currentReasoningPart);
+                reasoningPartCreated = false;
+                accumulatedReasoning.clear();
+                currentReasoningPart = Part{};
+            }
             // Create step-finish part with token tracking
             {
                 Part stepPart;
@@ -697,13 +1133,13 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, Message &assis
                     int64_t cacheW = event.usage.value("cache_creation_input_tokens", 0);
                     int64_t reasoningT = event.usage.value("reasoning_tokens", 0);
 
-                    stepPart.data["tokens"] = {
+                    stepPart.data["tokens"] = json::object({
                         {"input", inputT},
                         {"output", outputT},
                         {"reasoning", reasoningT},
                         {"cache_read", cacheR},
                         {"cache_write", cacheW}
-                    };
+                    });
 
                     // Calculate cost: prefer config pricing, fallback to hardcoded table
                     double cost = 0.0;
@@ -727,6 +1163,8 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, Message &assis
                 stepPart.timeCreated = util::nowMs();
                 stepPart.timeUpdated = stepPart.timeCreated;
                 m_sessionMgr.addPart(stepPart);
+                lastStepFinishPart = stepPart;
+                stepFinishCreated = true;
 
                 // Content filter detection
                 if (event.text == "content_filter" || event.text == "content-filter") {
@@ -759,6 +1197,7 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, Message &assis
         }
     });  // end stream callback
 
+            LOG_INFO("[processLLMRound] stream completed, total events=" + std::to_string(eventCount) + " accumulatedText len=" + std::to_string(accumulatedText.size()));
             streamCompleted = true;  // Stream finished without exception
         } catch (const std::exception &e) {
             std::string errMsg = sanitizeUtf8(e.what());
@@ -766,14 +1205,17 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, Message &assis
 
             if (attempt < retryCfg.maxRetries && SessionRetry::isRetryable(errMsg)) {
                 LOG_WARN("Retryable error, will retry...");
-                // Update session status to retry
-                m_sessionMgr.setStatus(sessionId, SessionStatus::Busy);
-                m_events.publish(EventType::SessionUpdated, {
+                lastError = errMsg;
+                // v1 shape: session.status with status: {type: "retry", attempt, message, next}
+                m_events.publish(EventType::SessionStatus, json::object({
                     {"sessionID", sessionId},
-                    {"status", "retry"},
-                    {"attempt", attempt + 1},
-                    {"message", errMsg}
-                });
+                    {"status", json::object({
+                        {"type", "retry"},
+                        {"attempt", attempt + 1},
+                        {"message", errMsg},
+                        {"next", util::nowMs() + SessionRetry::calculateDelay(attempt + 1, retryCfg)}
+                    })}
+                }));
                 continue;
             }
 
@@ -784,6 +1226,11 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, Message &assis
                 {"message", errMsg}
             };
             assistantMsg.data["error"] = error;
+            // Finalize pending tool parts from the failed stream (v1 cleanup:
+            // nothing may hang in the transcript when the round ends abnormally)
+            finalizeInterruptedToolParts(sessionId, assistantMsg.id);
+            recordStepEndState(sessionId, assistantMsg.id, snapshotHash,
+                               lastStepFinishPart, stepFinishCreated);
             m_events.publish(EventType::SessionError, {
                 {"sessionID", sessionId},
                 {"error", error}
@@ -794,11 +1241,20 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, Message &assis
 
     // Update assistant message data
     // Token data is already set from StepFinish event if available
-    if (!assistantMsg.data.contains("tokens")) {
-        // Fallback: rough estimate if provider didn't return usage
-        assistantMsg.data["tokens"] = accumulatedText.size() / 4;
+    if (!assistantMsg.data.contains("tokens") || !assistantMsg.data["tokens"].is_object()) {
+        // Fallback: rough estimate if provider didn't return usage (stored in
+        // the object form so Message::toJson emits the v1 nested shape)
+        assistantMsg.data["tokens"] = json::object({{"input", accumulatedText.size() / 4}});
     }
     assistantMsg.timeUpdated = util::nowMs();
+
+    // Persist a pending reasoning part even if the provider skipped StepFinish
+    if (reasoningPartCreated) {
+        currentReasoningPart.data["text"] = accumulatedReasoning;
+        currentReasoningPart.timeUpdated = util::nowMs();
+        m_sessionMgr.updatePart(currentReasoningPart);
+        reasoningPartCreated = false;
+    }
 
     // If no text part was created but we have text, create one now
     if (!accumulatedText.empty() && !textPartCreated) {
@@ -813,6 +1269,8 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, Message &assis
     }
 
     // If no tool calls, we're done
+    recordStepEndState(sessionId, assistantMsg.id, snapshotHash,
+                       lastStepFinishPart, stepFinishCreated);
     if (!hasToolCalls) {
         return false;
     }
@@ -825,26 +1283,82 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, Message &assis
     assistantChat.toolCalls = toolCalls;
     chatHistory.push_back(assistantChat);
 
-    // Execute each tool and add results
-    for (const auto &tc : toolCalls) {
-        ToolResult toolResult = executeToolCall(tc);
+    // Execute each tool and add results. v1 runs tool calls concurrently
+    // ("unbounded"); only the execution is parallel here — every DB/event
+    // write stays on this thread, so part ordering and the chatHistory
+    // replay order stay deterministic.
 
-        // Create tool-result part
+    // Phase 1: mark every tool part running (clients see queued → active).
+    // Going through the in-round map (instead of rescanning recent messages
+    // by callID) guarantees a callID the model re-issued updates its own part
+    // and never re-publishes an older part that shares the id.
+    for (const auto &tc : toolCalls) {
+        auto partIt = toolParts.find(tc.id);
+        if (partIt == toolParts.end()) {
+            LOG_WARN("No tool part recorded for call id=" + tc.id);
+            continue;
+        }
+        // v1 ToolStateRunning: the part is visibly "running" while the
+        // tool executes, so clients can tell queued work from active work
+        Part &p = partIt->second;
+        p.data["state"] = json::object({
+            {"status", "running"},
+            {"input", p.data["state"].value("input", json::object())},
+            {"time", json::object({{"start", util::nowMs()}})}
+        });
+        p.timeUpdated = util::nowMs();
+        m_sessionMgr.updatePart(p);
+    }
+
+    // Phase 2: run the calls. executeToolCall only touches mutex-guarded
+    // state (SessionManager/Database/EventBus/PermissionManager/Logger), so
+    // plain threads are safe; results land in call order. A single call runs
+    // inline to skip the thread overhead.
+    std::vector<ToolResult> results(toolCalls.size());
+    if (toolCalls.size() == 1) {
+        results[0] = executeToolCall(sessionId, sessionDir, toolCalls[0]);
+    } else if (toolCalls.size() > 1) {
+        std::vector<std::thread> workers;
+        workers.reserve(toolCalls.size());
+        for (size_t i = 0; i < toolCalls.size(); ++i) {
+            workers.emplace_back([this, &results, i, &toolCalls, sessionId, sessionDir]() {
+                try {
+                    results[i] = executeToolCall(sessionId, sessionDir, toolCalls[i]);
+                } catch (const std::exception &e) {
+                    // executeToolCall catches tool errors already; this guards
+                    // the wrapper itself so a worker never terminates the process
+                    results[i].success = false;
+                    results[i].error = std::string("Tool execution error: ") + e.what();
+                }
+            });
+        }
+        for (auto &t : workers) t.join();
+    }
+
+    // Phase 3: persist in call order on this thread
+    for (size_t i = 0; i < toolCalls.size(); ++i) {
+        const auto &tc = toolCalls[i];
+        const ToolResult &toolResult = results[i];
+
+        // Create tool-result part (internal storage shape; toWithPartsJson
+        // merges it into the tool part). Publish=false: opencode never emits
+        // tool-result parts on the event stream, the tool part state update
+        // below carries the result to clients.
         Part resultPart;
         resultPart.id = util::uuid4();
         resultPart.messageId = assistantMsg.id;
         resultPart.sessionId = sessionId;
         resultPart.type = "tool-result";
-        resultPart.data = {
+        resultPart.data = json::object({
             {"toolCallID", tc.id},
             {"name", tc.name},
             {"output", toolResult.output},
             {"success", toolResult.success},
             {"error", toolResult.error}
-        };
+        });
         resultPart.timeCreated = util::nowMs();
         resultPart.timeUpdated = resultPart.timeCreated;
-        m_sessionMgr.addPart(resultPart);
+        m_sessionMgr.addPart(resultPart, false);
 
         // Add tool result to chat history
         ChatMessage toolMsg;
@@ -855,59 +1369,134 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, Message &assis
             : "Error: " + toolResult.error;
         chatHistory.push_back(toolMsg);
 
-        // Update the corresponding tool part state with result
-        auto msgs = m_sessionMgr.getMessages(sessionId, 10);
-        for (auto &msg : msgs) {
-            if (msg.role != MessageRole::Assistant) continue;
-            for (auto &p : msg.parts) {
-                if (p.type == "tool" && p.data.value("callID", "") == tc.id) {
-                    std::string status = toolResult.success ? "completed" : "error";
-                    p.data["state"] = {
-                        {"status", status},
-                        {"input", p.data["state"].value("input", json::object())},
-                        {"output", toolResult.success ? toolResult.output : "Error: " + toolResult.error},
-                        {"title", tc.name},
-                        {"metadata", json::object()},
-                        {"time", {{"start", p.timeCreated}, {"end", util::nowMs()}}}
-                    };
-                    p.timeUpdated = util::nowMs();
-                    m_sessionMgr.updatePart(p);
-                    m_events.publish(EventType::PartUpdated, {
-                        {"sessionID", sessionId},
-                        {"part", p.toJson()},
-                        {"time", util::nowMs()}
-                    });
-                    break;
-                }
-            }
-        }
+        auto partIt = toolParts.find(tc.id);
+        if (partIt == toolParts.end()) continue;
 
-        // Publish tool result event
-        m_events.publish(EventType::PartUpdated, {
-            {"sessionID", sessionId},
-            {"part", resultPart.toJson()},
-            {"time", util::nowMs()}
+        // Update the tool part to its final state. v1 tool states: completed
+        // carries the output and title; error carries the failure text in
+        // "error" (never "output").
+        Part &p = partIt->second;
+        json state = json::object({
+            {"status", toolResult.success ? "completed" : "error"},
+            {"input", p.data["state"].value("input", json::object())},
+            {"metadata", json::object()},
+            {"time", json::object({{"start", p.timeCreated}, {"end", util::nowMs()}})}
         });
+        if (toolResult.success) {
+            state["output"] = toolResult.output;
+            state["title"] = tc.name;
+        } else {
+            state["error"] = toolResult.error.empty() ? toolResult.output : toolResult.error;
+        }
+        p.data["state"] = state;
+        p.timeUpdated = util::nowMs();
+        // updatePart saves to DB and publishes PartUpdated event
+        m_sessionMgr.updatePart(p);
     }
+
+    // Round finished: sweep any tool part still pending/running (retry
+    // orphans, calls dropped mid-stream) so nothing hangs in the transcript
+    finalizeInterruptedToolParts(sessionId, assistantMsg.id);
+
+    // v1 step-finish semantics: stamp the completed snapshot (taken after the
+    // tools ran) and record a PatchPart when this step changed files
+    recordStepEndState(sessionId, assistantMsg.id, snapshotHash,
+                       lastStepFinishPart, stepFinishCreated);
 
     return true;  // Tools were called, need another round
 }
 
-void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &userText)
+void SessionPrompt::recordStepEndState(const std::string &sessionId, const std::string &messageId,
+                                         const std::string &startSnapshot,
+                                         Part &stepFinishPart, bool stepFinishCreated)
+{
+    if (!m_snapshot || !m_snapshot->isInitialized()) return;
+
+    // v1 takes the completed snapshot after the step's tools have run, so the
+    // step-finish part records the post-turn tree state
+    std::string completedSnapshot = m_snapshot->track();
+    if (!completedSnapshot.empty() && stepFinishCreated &&
+        stepFinishPart.data.value("snapshot", "").empty()) {
+        stepFinishPart.data["snapshot"] = completedSnapshot;
+        stepFinishPart.timeUpdated = util::nowMs();
+        m_sessionMgr.updatePart(stepFinishPart);
+    }
+
+    // v1 PatchPart: file changes this step made, keyed to the step-start
+    // snapshot. Emitted only when something actually changed.
+    if (startSnapshot.empty()) return;
+    auto entries = m_snapshot->patch(startSnapshot);
+    if (entries.empty()) return;
+
+    json files = json::array();
+    for (const auto &e : entries) {
+        // v1 emits absolute, forward-slash paths
+        std::string abs = m_snapshot->worktree() + "/" + e.filePath;
+        std::replace(abs.begin(), abs.end(), '\\', '/');
+        files.push_back(abs);
+    }
+
+    Part patchPart;
+    patchPart.id = util::uuid4();
+    patchPart.messageId = messageId;
+    patchPart.sessionId = sessionId;
+    patchPart.type = "patch";
+    patchPart.data = {{"hash", startSnapshot}, {"files", files}};
+    patchPart.timeCreated = util::nowMs();
+    patchPart.timeUpdated = patchPart.timeCreated;
+    m_sessionMgr.addPart(patchPart);
+}
+
+void SessionPrompt::finalizeInterruptedToolParts(const std::string &sessionId, const std::string &messageId)
+{
+    // v1 cleanup semantics (processor.ts): tool parts still pending or running
+    // when the round ends abnormally are finalized as errors with
+    // metadata.interrupted, so clients see the interruption instead of a part
+    // that never resolves
+    auto messages = m_sessionMgr.getMessages(sessionId, 1000);
+    for (auto &msg : messages) {
+        if (msg.id != messageId) continue;
+        for (auto &part : msg.parts) {
+            if (part.type != "tool") continue;
+            json state = part.data.value("state", json::object());
+            std::string status = state.value("status", "");
+            if (status != "pending" && status != "running") continue;
+
+            json metadata = state.value("metadata", json::object());
+            metadata["interrupted"] = true;
+            state["status"] = "error";
+            state["error"] = "Tool execution aborted";
+            state["metadata"] = metadata;
+            int64_t start = part.timeCreated;
+            if (state.contains("time") && state["time"].is_object() && state["time"].contains("start")) {
+                start = state["time"]["start"].get<int64_t>();
+            }
+            state["time"] = json::object({{"start", start}, {"end", util::nowMs()}});
+
+            part.data["state"] = state;
+            part.timeUpdated = util::nowMs();
+            m_sessionMgr.updatePart(part);
+        }
+        return;
+    }
+}
+
+void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &userText,
+                              const json &inputParts)
 {
     LOG_INFO("Starting prompt for session: " + sessionId);
 
     // Set session to busy
     m_sessionMgr.setStatus(sessionId, SessionStatus::Busy);
 
-    // Add user message
-    LOG_INFO("[runPrompt] step 1: makeUserMessage");
-    Message userMsg = makeUserMessage(sessionId, userText);
-    LOG_INFO("[runPrompt] step 2: addMessage(userMsg)");
+    // Add user message (v1 input parts when supplied, plain text otherwise)
+    //LOG_INFO("[runPrompt] step 1: makeUserMessage");
+    Message userMsg = makeUserMessageWithParts(sessionId, userText, inputParts);
+    //LOG_INFO("[runPrompt] step 2: addMessage(userMsg)");
     m_sessionMgr.addMessage(userMsg);
 
     // Get session info
-    LOG_INFO("[runPrompt] step 3: getSession");
+    //LOG_INFO("[runPrompt] step 3: getSession");
     SessionInfo *session = m_sessionMgr.getSession(sessionId);
     if (!session) {
         LOG_ERROR("Session not found: " + sessionId);
@@ -921,7 +1510,7 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
     }
 
     // Resolve provider and model
-    LOG_INFO("[runPrompt] step 4: resolveProvider session.model=[" + session->model + "] session.providerId=[" + session->providerId + "]");
+    //LOG_INFO("[runPrompt] step 4: resolveProvider session.model=[" + session->model + "] session.providerId=[" + session->providerId + "]");
     std::string model;
     Provider *provider = resolveProvider(*session, model);
     if (!provider) {
@@ -934,18 +1523,18 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
         return;
     }
 
-    LOG_INFO("Using provider: " + provider->id() + " model: " + model);
+    //LOG_INFO("Using provider: " + provider->id() + " model: " + model);
 
     // Resolve model configuration (limit, cost, tool_call, temperature)
-    LOG_INFO("[runPrompt] step 5: resolveModelConfig");
+    //LOG_INFO("[runPrompt] step 5: resolveModelConfig");
     Config::ModelConfig modelCfg = m_config.resolveModelConfig(session->providerId, model);
 
     // Build chat messages
-    LOG_INFO("[runPrompt] step 6: buildChatMessages");
+    //LOG_INFO("[runPrompt] step 6: buildChatMessages");
     auto chatHistory = buildChatMessages(sessionId);
 
     // Prepend system prompt
-    LOG_INFO("[runPrompt] step 7: buildSystemPrompt");
+    //LOG_INFO("[runPrompt] step 7: buildSystemPrompt");
     std::string systemPrompt = buildSystemPrompt(*session);
     ChatMessage systemMsg;
     systemMsg.role = "system";
@@ -953,7 +1542,7 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
     chatHistory.insert(chatHistory.begin(), systemMsg);
 
     // Create assistant message (will be filled by LLM)
-    LOG_INFO("[runPrompt] step 8: makeAssistantMessage model=[" + model + "] provider=[" + provider->id() + "]");
+    //LOG_INFO("[runPrompt] step 8: makeAssistantMessage model=[" + model + "] provider=[" + provider->id() + "]");
     // Hex dump of model bytes
     {
         std::string hex;
@@ -976,7 +1565,7 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
         LOG_INFO("[runPrompt] providerId hex (" + std::to_string(pid.size()) + " bytes): " + hex);
     }
     Message assistantMsg = makeAssistantMessage(sessionId, model, provider->id());
-    LOG_INFO("[runPrompt] step 9: makeAssistantMessage done, trying dump...");
+    //LOG_INFO("[runPrompt] step 9: makeAssistantMessage done, trying dump...");
     try {
         std::string dumpStr = assistantMsg.data.dump();
         LOG_INFO("[runPrompt] step 9: dump OK: " + dumpStr.substr(0, 200));
@@ -984,7 +1573,7 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
         LOG_ERROR("[runPrompt] step 9: dump FAILED: " + std::string(e.what()));
     }
     m_sessionMgr.addMessage(assistantMsg);
-    LOG_INFO("[runPrompt] step 10: entering main loop");
+    //LOG_INFO("[runPrompt] step 10: entering main loop");
 
     // Main loop: keep calling LLM until no more tool calls
     int maxRounds = 20;  // Safety limit
@@ -1006,6 +1595,9 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
             auto it = m_abortFlags.find(sessionId);
             if (it != m_abortFlags.end() && it->second) {
                 LOG_INFO("Prompt aborted for session: " + sessionId);
+                // v1 cleanup: pending/running tool parts become interrupted
+                // errors instead of hanging in the transcript forever
+                finalizeInterruptedToolParts(sessionId, assistantMsg.id);
                 m_sessionMgr.setStatus(sessionId, SessionStatus::Idle);
                 return;
             }
@@ -1014,7 +1606,7 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
         ++round;
         LOG_INFO("LLM round " + std::to_string(round) + " for session: " + sessionId);
 
-        bool toolsCalled = processLLMRound(sessionId, assistantMsg, provider, model, modelCfg, chatHistory);
+        bool toolsCalled = processLLMRound(sessionId, session->directory, assistantMsg, provider, model, modelCfg, chatHistory);
 
         // Auto-generate title after first round if conditions are met
         if (round == 1 && session->parentId.empty() &&
@@ -1048,7 +1640,32 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
         LOG_INFO("Tools were called, starting round " + std::to_string(round + 1));
 
         // Check context window usage and compact if needed
-        checkAndCompact(chatHistory, provider, model, modelCfg, sessionId);
+        if (checkAndCompact(chatHistory, provider, model, modelCfg, sessionId)) {
+            // Record the compaction in the transcript (v1 semantics: a synthetic
+            // user message with a CompactionPart marks where the context was
+            // compacted; the in-flight history was already rewritten above)
+            Message compactMsg;
+            compactMsg.id = util::uuid4();
+            compactMsg.sessionId = sessionId;
+            compactMsg.role = MessageRole::User;
+            compactMsg.timeCreated = util::nowMs();
+            compactMsg.timeUpdated = compactMsg.timeCreated;
+            compactMsg.data = {
+                {"agent", session->agentId.empty() ? "build" : session->agentId},
+                {"providerID", session->providerId},
+                {"model", session->model}
+            };
+            Part compactPart;
+            compactPart.id = util::uuid4();
+            compactPart.messageId = compactMsg.id;
+            compactPart.sessionId = sessionId;
+            compactPart.type = "compaction";
+            compactPart.data = json::object({{"auto", true}});
+            compactPart.timeCreated = compactMsg.timeCreated;
+            compactPart.timeUpdated = compactMsg.timeCreated;
+            compactMsg.parts.push_back(compactPart);
+            m_sessionMgr.addMessage(compactMsg);
+        }
     }
 
     // Update assistant message with final data
@@ -1061,6 +1678,13 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
     if (m_memory && !session->projectId.empty()) {
         m_memory->extractKnowledgeAsync(userText, session->projectId,
                                          session->providerId, model);
+
+        // Trigger memory extraction every 5 rounds
+        static const int MEMORY_EXTRACT_INTERVAL = 5;
+        if (round >= MEMORY_EXTRACT_INTERVAL) {
+            triggerMemoryExtraction(sessionId, session->projectId,
+                                    provider, model, chatHistory);
+        }
     }
 
     LOG_INFO("Prompt completed for session: " + sessionId +

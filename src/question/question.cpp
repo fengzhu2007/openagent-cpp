@@ -29,12 +29,12 @@ std::string QuestionManager::ask(const std::string &sessionId, const std::string
     }
 
     // Publish question.created event (SSE push to frontend)
-    json eventData = {
+    json eventData = json::object({
         {"id", requestId},
         {"sessionID", sessionId},
         {"question", question},
         {"timeCreated", pending->request.timeCreated}
-    };
+    });
     if (!options.empty()) {
         eventData["options"] = options;
     }
@@ -106,26 +106,40 @@ bool QuestionManager::reply(const std::string &requestId, const std::string &ans
 
 bool QuestionManager::reject(const std::string &requestId)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    auto it = m_pending.find(requestId);
-    if (it == m_pending.end()) {
-        return false;
+    std::string sessionId;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_pending.find(requestId);
+        if (it == m_pending.end()) {
+            return false;
+        }
+
+        if (it->second->request.answered) {
+            return false;  // Already answered
+        }
+
+        sessionId = it->second->request.sessionId;
+
+        // Set an exception to unblock the waiting thread with an error
+        try {
+            it->second->promise.set_exception(
+                std::make_exception_ptr(std::runtime_error("Question rejected")));
+        } catch (...) {
+            return false;
+        }
+
+        it->second->request.answered = true;
+        it->second->request.answer = "(rejected)";
     }
 
-    if (it->second->request.answered) {
-        return false;  // Already answered
-    }
+    // Publish question.rejected (v1 shape: {sessionID, requestID}); kept
+    // outside the lock so listeners can safely call back into the manager
+    m_events.publish(EventType::QuestionRejected, {
+        {"sessionID", sessionId},
+        {"requestID", requestId}
+    });
 
-    // Set an exception to unblock the waiting thread with an error
-    try {
-        it->second->promise.set_exception(
-            std::make_exception_ptr(std::runtime_error("Question rejected")));
-    } catch (...) {
-        return false;
-    }
-
-    it->second->request.answered = true;
-    it->second->request.answer = "(rejected)";
+    LOG_INFO("Question rejected: " + requestId);
     return true;
 }
 

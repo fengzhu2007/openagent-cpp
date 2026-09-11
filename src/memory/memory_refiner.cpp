@@ -1,4 +1,5 @@
 #include "memory/memory_refiner.h"
+#include "tool/builtin/shell_common.h"
 #include "memory/memory_embedder.h"
 #include "util/uuid.h"
 #include "util/logger.h"
@@ -175,7 +176,7 @@ void MemoryRefiner::extractFromToolCalls(const std::vector<SignalEvent> &events,
         toolCounts[toolName]++;
 
         // Store an example command if it's a shell tool
-        if (toolName == "shell" && ev.detail.contains("command")) {
+        if (isShellTool(toolName) && ev.detail.contains("command")) {
             std::string cmd = ev.detail["command"].get<std::string>();
             if (toolExamples.find(toolName) == toolExamples.end() && cmd.size() < 200) {
                 toolExamples[toolName] = cmd;

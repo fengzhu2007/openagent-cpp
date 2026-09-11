@@ -1,21 +1,21 @@
-#include "tool/builtin/shell_tool.h"
+#include "tool/builtin/cmd_tool.h"
 #include "tool/builtin/shell_common.h"
 
-std::string ShellTool::description() const
+std::string CmdTool::description() const
 {
-    return "Execute a shell command and return its output. "
-           "Use for running build commands, tests, git operations, etc. "
+    return "Execute a Windows cmd.exe command and return its output. "
+           "Use for running batch commands, system utilities, build tools, git operations, etc. "
            "Set pty=true for interactive programs that require a terminal.";
 }
 
-json ShellTool::parameters() const
+json CmdTool::parameters() const
 {
     return {
         {"type", "object"},
         {"properties", {
             {"command", {
                 {"type", "string"},
-                {"description", "The shell command to execute"}
+                {"description", "The cmd.exe command to execute"}
             }},
             {"timeout", {
                 {"type", "integer"},
@@ -30,24 +30,18 @@ json ShellTool::parameters() const
     };
 }
 
-ToolResult ShellTool::execute(const json &args, const std::string &cwd)
+ToolResult CmdTool::execute(const json &args, const std::string &cwd)
 {
     std::string command = args.value("command", "");
     if (command.empty()) {
-        return {false, "", "No command specified", "shell"};
+        return {false, "", "No command specified", "cmd"};
     }
 
     int timeout = args.value("timeout", 30);
     bool usePty = args.value("pty", false);
 
     if (usePty) {
-#ifdef _WIN32
-        return executePty(command, timeout, cwd, "cmd.exe", {"/c"}, "shell");
-#else
-        const char *shellEnv = std::getenv("SHELL");
-        std::string shell = shellEnv ? shellEnv : "/bin/sh";
-        return executePty(command, timeout, cwd, shell, {"-c"}, "shell");
-#endif
+        return executePty(command, timeout, cwd, "cmd.exe", {"/c"}, "cmd");
     }
-    return executePopen(command, timeout, cwd, "shell", "shell");
+    return executePopen(command, timeout, cwd, "cmd", "cmd");
 }

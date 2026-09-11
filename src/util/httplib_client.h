@@ -6,6 +6,10 @@
 // HTTP client wrapper using libcurl
 class HttpClient {
 public:
+    // Set proxy for all requests (e.g. "http://127.0.0.1:7890")
+    static void setProxy(const std::string &proxyUrl);
+    static std::string proxy();
+
     // POST request, returns response body
     static std::string post(const std::string &url, const std::string &body,
                            const std::vector<std::string> &headers = {});
