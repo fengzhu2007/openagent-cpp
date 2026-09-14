@@ -7,27 +7,41 @@
 #include <algorithm>
 #include <functional>
 #include <unordered_map>
+#include <set>
 #include <cstdlib>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 #ifdef _WIN32
 #include <direct.h>
 #define PATH_SEP "\\"
 #else
 #include <unistd.h>
+#include <climits>
 #define PATH_SEP "/"
 #endif
 
-SnapshotManager::SnapshotManager(const std::string &dataDir, const std::string &worktree)
-    : m_dataDir(dataDir), m_worktree(worktree)
+// Convert a path to absolute (resolves relative paths like ".")
+static std::string toAbsolutePath(const std::string &path)
 {
-    m_repoPath = dataDir + PATH_SEP + std::string("snapshot") + PATH_SEP + hashPath(worktree);
+    if (path.empty()) return path;
+    std::error_code ec;
+    auto abs = fs::absolute(path, ec);
+    if (ec) return path;
+    return abs.string();
+}
 
-    if (isGitAvailable()) {
-        m_initialized = initRepo();
-        if (m_initialized) {
-            LOG_INFO("Snapshot repo initialized at: " + m_repoPath);
-        }
-    } else {
+SnapshotManager::SnapshotManager(const std::string &dataDir, const std::string &worktree)
+    : m_dataDir(dataDir), m_worktree(toAbsolutePath(worktree))
+{
+    // Use absolute path for repoPath so git works regardless of cwd
+    std::string absDataDir = toAbsolutePath(dataDir);
+    m_repoPath = absDataDir + PATH_SEP + std::string("snapshot") + PATH_SEP + hashPath(m_worktree);
+
+    // Lazy init: repo is created on first track() call, not here.
+    // This avoids creating bare repos for directories that never change.
+    if (!isGitAvailable()) {
         LOG_WARN("Git CLI not available, snapshot system disabled");
     }
 }
@@ -40,7 +54,43 @@ bool SnapshotManager::isGitAvailable() const
 
 bool SnapshotManager::isInitialized() const
 {
-    return m_initialized;
+    // With lazy init, "initialized" means the manager is ready to use
+    // (worktree is set and git is available), not that the bare repo exists yet.
+    return !m_worktree.empty();
+}
+
+void SnapshotManager::setWorktree(const std::string &worktree)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_worktree = toAbsolutePath(worktree);
+    std::string absDataDir = toAbsolutePath(m_dataDir);
+    m_repoPath = absDataDir + PATH_SEP + std::string("snapshot") + PATH_SEP + hashPath(m_worktree);
+    m_initialized = false;  // Will be lazy-initialized on first track()
+}
+
+void SnapshotManager::cleanup()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_repoPath.empty()) return;
+
+    std::error_code ec;
+    if (fs::exists(m_repoPath, ec)) {
+        fs::remove_all(m_repoPath, ec);
+        if (ec) {
+            LOG_ERROR("Failed to cleanup snapshot repo: " + m_repoPath + " - " + ec.message());
+        } else {
+            LOG_INFO("Snapshot repo cleaned up: " + m_repoPath);
+        }
+    }
+    m_initialized = false;
+}
+
+bool SnapshotManager::hasTree(const std::string &treeHash) const
+{
+    if (!m_initialized || treeHash.empty()) return false;
+    // ls-tree works in bare repos without core.worktree
+    std::string result = gitExec("ls-tree " + treeHash, false);
+    return !result.empty() && result.find("fatal:") == std::string::npos;
 }
 
 std::string SnapshotManager::hashPath(const std::string &path)
@@ -58,7 +108,11 @@ std::string SnapshotManager::hashPath(const std::string &path)
 bool SnapshotManager::initRepo()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    return initRepoLocked();
+}
 
+bool SnapshotManager::initRepoLocked()
+{
     // Create snapshot directory
     std::string snapDir = m_dataDir + PATH_SEP + "snapshot";
 #ifdef _WIN32
@@ -71,7 +125,11 @@ bool SnapshotManager::initRepo()
     std::string headPath = m_repoPath + PATH_SEP + "HEAD";
     std::ifstream check(headPath);
     if (check.good()) {
-        return true;  // Already initialized
+        // Repo exists — ensure core.worktree is set (may be missing from
+        // older repos created before the fix).
+        gitExecBool("--git-dir \"" + m_repoPath + "\" config core.worktree \"" + m_worktree + "\"", false);
+        writeExcludePatterns();
+        return true;
     }
 
     // Initialize bare git repo
@@ -81,9 +139,54 @@ bool SnapshotManager::initRepo()
     }
 
     // Configure the repo to allow working on files outside
-    gitExecBool("config core.worktree \"" + m_worktree + "\"", false);
+    // Must use --git-dir to target the bare repo we just created,
+    // since the current working directory is not inside it.
+    gitExecBool("--git-dir \"" + m_repoPath + "\" config core.worktree \"" + m_worktree + "\"", false);
+
+    // Write exclude patterns to skip large directories during git add -A
+    writeExcludePatterns();
 
     return true;
+}
+
+void SnapshotManager::writeExcludePatterns()
+{
+    // Write .git/info/exclude (bare repo: info/exclude) to skip common
+    // large directories that should never be tracked in snapshots.
+    // This prevents git add -A from scanning hundreds of thousands of files.
+    std::string infoDir = m_repoPath + PATH_SEP + "info";
+#ifdef _WIN32
+    _mkdir(infoDir.c_str());
+#else
+    mkdir(infoDir.c_str(), 0755);
+#endif
+
+    std::string excludePath = infoDir + PATH_SEP + "exclude";
+    std::ofstream out(excludePath);
+    if (!out.is_open()) return;
+
+    out << "# Auto-generated exclude patterns for snapshot performance\n"
+        << "node_modules/\n"
+        << ".git/\n"
+        << "__pycache__/\n"
+        << ".cache/\n"
+        << ".next/\n"
+        << "dist/\n"
+        << "build/\n"
+        << "target/\n"
+        << ".build/\n"
+        << "vendor/\n"
+        << ".gradle/\n"
+        << ".idea/\n"
+        << ".vs/\n"
+        << ".vscode/\n"
+        << "*.min.js\n"
+        << "*.min.css\n"
+        << "*.map\n"
+        << "*.lock\n"
+        << ".DS_Store\n"
+        << "Thumbs.db\n";
+    out.close();
 }
 
 std::string SnapshotManager::gitExec(const std::string &args, bool inWorktree) const
@@ -92,10 +195,13 @@ std::string SnapshotManager::gitExec(const std::string &args, bool inWorktree) c
     if (inWorktree) {
         // Execute in the worktree with GIT_DIR pointing to our snapshot repo.
         // Use platform-appropriate environment variable syntax.
+        // IMPORTANT: On Windows, use set "VAR=value" syntax — the outer quotes
+        // are stripped by cmd.exe and do NOT become part of the value.
+        // The old set VAR="value" syntax incorrectly includes quotes in the value.
 #ifdef _WIN32
         cmd = "cd /d \"" + m_worktree + "\" && "
-              "set GIT_DIR=\"" + m_repoPath + "\" && "
-              "set GIT_WORK_TREE=\"" + m_worktree + "\" && "
+              "set \"GIT_DIR=" + m_repoPath + "\" && "
+              "set \"GIT_WORK_TREE=" + m_worktree + "\" && "
               "git " + args + " 2>&1";
 #else
         cmd = "cd \"" + m_worktree + "\" && "
@@ -147,22 +253,63 @@ bool SnapshotManager::gitExecBool(const std::string &args, bool inWorktree) cons
 
 std::string SnapshotManager::track()
 {
-    if (!m_initialized) return "";
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    // Stage all changes: add all files from worktree
-    // Use GIT_DIR and GIT_WORK_TREE env vars
-    std::string addResult = gitExec("add -A", true);
+    // Lazy init: create the bare repo on first track() call
+    if (!m_initialized) {
+        if (!isGitAvailable()) return "";
+        m_initialized = initRepoLocked();
+        if (!m_initialized) return "";
+        LOG_INFO("Snapshot repo lazy-initialized at: " + m_repoPath);
+    }
+
+    // Use git status --porcelain to find changed files, then only git add
+    // those files instead of scanning the entire worktree with git add -A.
+    // This is much faster for large projects with node_modules etc.
+    std::string status = gitExec("status --porcelain", true);
+
+    if (status.empty()) {
+        // No changes — just write the current tree
+        std::string treeHash = gitExec("write-tree", true);
+        if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
+            LOG_ERROR("Failed to write tree: " + treeHash);
+            return "";
+        }
+        LOG_DEBUG("Snapshot tracked (no changes): tree=" + treeHash);
+        return treeHash;
+    }
+
+    // Parse status output and build git add command
+    // Format: "XY filename" or "XY \"filename with spaces\""
+    std::istringstream stream(status);
+    std::string line;
+    std::string filesToAdd;
+    int fileCount = 0;
+    while (std::getline(stream, line)) {
+        if (line.size() < 4) continue;
+        std::string filePath = line.substr(3);
+        // Trim trailing whitespace
+        while (!filePath.empty() && (filePath.back() == ' ' || filePath.back() == '\r'))
+            filePath.pop_back();
+        if (filePath.empty()) continue;
+        // Quote the file path for shell safety
+        if (!filesToAdd.empty()) filesToAdd += " ";
+        filesToAdd += "\"" + filePath + "\"";
+        fileCount++;
+    }
+
+    if (fileCount > 0) {
+        gitExec("add " + filesToAdd, true);
+    }
 
     // Write tree object
     std::string treeHash = gitExec("write-tree", true);
-
     if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
         LOG_ERROR("Failed to write tree: " + treeHash);
         return "";
     }
 
-    LOG_DEBUG("Snapshot tracked: tree=" + treeHash);
+    LOG_DEBUG("Snapshot tracked: tree=" + treeHash + " (" + std::to_string(fileCount) + " files)");
     return treeHash;
 }
 
@@ -313,6 +460,54 @@ bool SnapshotManager::revert(const std::vector<PatchEntry> &patches)
             // First read the tree, then checkout specific file
             gitExecBool("checkout-index -f -- \"" + p.filePath + "\"", true);
             LOG_INFO("Reverted file: " + p.filePath);
+        }
+    }
+
+    return true;
+}
+
+bool SnapshotManager::revertPatches(const std::vector<SnapshotPatch> &patches)
+{
+    if (!m_initialized || patches.empty()) return false;
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    std::set<std::string> done;
+
+    // Process patches in reverse order (matching opencode: undo newest first)
+    for (auto it = patches.rbegin(); it != patches.rend(); ++it) {
+        const std::string &treeHash = it->hash;
+
+        for (const std::string &absPath : it->files) {
+            // Convert absolute forward-slash path to relative path
+            std::string rel = absPath;
+            std::replace(rel.begin(), rel.end(), '/', '\\');
+            std::string wt = m_worktree;
+            std::replace(wt.begin(), wt.end(), '/', '\\');
+            if (rel.find(wt) == 0) {
+                rel = rel.substr(wt.size());
+                while (!rel.empty() && (rel[0] == '\\' || rel[0] == '/'))
+                    rel.erase(0, 1);
+            }
+            std::replace(rel.begin(), rel.end(), '\\', '/');
+
+            if (!done.insert(rel).second) continue;
+
+            LOG_INFO("reverting: file=" + rel + " hash=" + treeHash);
+
+            // Check if the file existed in this tree
+            std::string lsResult = gitExec(
+                "ls-tree " + treeHash + " -- \"" + rel + "\"", true);
+
+            if (!lsResult.empty() && lsResult.find("fatal:") == std::string::npos) {
+                // File existed in the snapshot tree — restore it
+                gitExecBool("checkout " + treeHash + " -- \"" + absPath + "\"", true);
+            } else {
+                // File did not exist in the snapshot — delete it
+                std::string fullPath = m_worktree + PATH_SEP + rel;
+                std::replace(fullPath.begin(), fullPath.end(), '/', '\\');
+                std::remove(fullPath.c_str());
+                LOG_INFO("file did not exist in snapshot, deleting: " + rel);
+            }
         }
     }
 

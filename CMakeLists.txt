@@ -72,6 +72,7 @@ set(OPENCODE_SOURCES
     src/tool/builtin/edit_tool.cpp
     src/tool/builtin/glob_tool.cpp
     src/tool/builtin/grep_tool.cpp
+    src/tool/builtin/fetch_tool.cpp
     src/tool/builtin/task_tool.cpp
     src/tool/builtin/question_tool.cpp
     src/tool/builtin/skill_tool.cpp
@@ -133,6 +134,7 @@ set(OPENCODE_HEADERS
     src/tool/builtin/edit_tool.h
     src/tool/builtin/glob_tool.h
     src/tool/builtin/grep_tool.h
+    src/tool/builtin/fetch_tool.h
     src/tool/builtin/task_tool.h
     src/tool/builtin/question_tool.h
     src/tool/builtin/skill_tool.h

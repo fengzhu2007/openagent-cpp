@@ -17,6 +17,10 @@ namespace EventType {
     constexpr const char *SessionStatus    = "session.status";
     constexpr const char *SessionError     = "session.error";
     constexpr const char *SessionDiff      = "session.diff";
+    constexpr const char *SessionRevert    = "session.revert";
+
+    // File change notification (published after a conversation turn)
+    constexpr const char *FilesChanged     = "session.files_changed";
 
     // Message events
     constexpr const char *MessageUpdated   = "message.updated";

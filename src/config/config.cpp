@@ -3,13 +3,36 @@
 #include <fstream>
 #include <cstdlib>
 
+#ifdef _WIN32
+#include <direct.h>
+#endif
+
+static std::string defaultDataDir()
+{
+#ifdef _WIN32
+    // Use %LOCALAPPDATA%/anycode/data on Windows
+    const char *localAppData = std::getenv("LOCALAPPDATA");
+    if (localAppData && localAppData[0]) {
+        std::string dir = std::string(localAppData) + "\\anycode\\data";
+        // Ensure directory exists
+        _mkdir(dir.c_str());
+        // Also ensure parent "anycode" exists (mkdir only creates last component)
+        std::string parent = std::string(localAppData) + "\\anycode";
+        _mkdir(parent.c_str());
+        _mkdir(dir.c_str());
+        return dir;
+    }
+#endif
+    return ".";
+}
+
 Config::Config()
 {
     // Defaults
     m_data["port"] = 4096;
     m_data["host"] = "127.0.0.1";
     m_data["log_level"] = "info";
-    m_data["data_dir"] = ".";
+    m_data["data_dir"] = defaultDataDir();
 }
 
 void Config::loadFromFile(const std::string &path)

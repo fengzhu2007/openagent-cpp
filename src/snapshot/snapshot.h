@@ -17,6 +17,15 @@ struct PatchEntry {
     std::string afterHash;
 };
 
+// A patch representing file changes captured at a specific snapshot tree.
+// Matches opencode's Snapshot.Patch { hash, files }.
+// hash: the tree hash (step-start snapshot)
+// files: absolute paths with forward slashes
+struct SnapshotPatch {
+    std::string hash;
+    std::vector<std::string> files;  // absolute forward-slash paths
+};
+
 class SnapshotManager {
 public:
     // Initialize with data directory and worktree root
@@ -42,14 +51,32 @@ public:
     // Restore files to the state captured in a specific tree hash
     bool restore(const std::string &treeHash);
 
-    // Revert specific file changes using patches
+    // Revert specific file changes using patches (legacy PatchEntry-based)
     bool revert(const std::vector<PatchEntry> &patches);
+
+    // Revert file changes from SnapshotPatches (opencode PatchPart semantics).
+    // Processes patches in reverse order; for each file, checks out the version
+    // from the tree hash or deletes the file if it didn't exist in that tree.
+    bool revertPatches(const std::vector<SnapshotPatch> &patches);
+
+    // Update the worktree root path and re-initialize the snapshot repo.
+    // Called when the IDE sets the working directory, so that track()/patch()
+    // operate on the user's project instead of the executable directory.
+    void setWorktree(const std::string &worktree);
+
+    // Check if a given tree hash exists in this snapshot's repo.
+    // Used to route patches to the correct SnapshotManager in multi-directory setups.
+    bool hasTree(const std::string &treeHash) const;
 
     // Get the worktree root path
     const std::string &worktree() const { return m_worktree; }
 
     // Get the snapshot repo path
     const std::string &repoPath() const { return m_repoPath; }
+
+    // Delete the bare repo directory from disk, releasing all storage.
+    // After cleanup, the manager is reset and can be lazy-initialized again.
+    void cleanup();
 
 private:
     // Execute a git command in the snapshot repo and return stdout
@@ -60,6 +87,12 @@ private:
 
     // Initialize the bare git repo for snapshots
     bool initRepo();
+
+    // Core init logic without locking (caller must hold m_mutex)
+    bool initRepoLocked();
+
+    // Write exclude patterns to info/exclude (skips node_modules etc.)
+    void writeExcludePatterns();
 
     // Compute a short hash of the worktree path for repo naming
     static std::string hashPath(const std::string &path);

@@ -13,6 +13,8 @@
 #include <condition_variable>
 #include <fstream>
 #include <sstream>
+#include <set>
+#include <map>
 #ifdef _WIN32
 #include <windows.h>
 #define POPEN _popen
@@ -150,7 +152,7 @@ Server::Server(const std::string &host, uint16_t port,
     m_permission = std::make_unique<PermissionManager>(m_db, m_events);
     std::string dataDir = m_config.getString("data_dir", ".");
     std::string worktree = m_config.getString("worktree", ".");
-    m_snapshot = std::make_unique<SnapshotManager>(dataDir, worktree);
+    m_snapshots.push_back(std::make_unique<SnapshotManager>(dataDir, worktree));
     m_commands = std::make_unique<CommandManager>(m_config);
     m_commands->loadAll();
     m_agents = std::make_unique<AgentManager>();
@@ -175,15 +177,22 @@ Server::Server(const std::string &host, uint16_t port,
     m_memory = std::make_unique<MemoryManager>(m_db, m_events, m_config);
     m_memory->setProviderRegistry(&m_providers);
     m_memory->start();
-    m_prompt = std::make_unique<SessionPrompt>(m_sessionMgr, m_providers, m_tools, m_events, m_config, m_permission.get(), m_snapshot.get(), m_agents.get(), m_memory.get());
+    m_prompt = std::make_unique<SessionPrompt>(m_sessionMgr, m_providers, m_tools, m_events, m_config, m_permission.get(), nullptr, m_agents.get(), m_memory.get());
     // Set the working directories getter so SessionPrompt can access global working dirs
     m_prompt->setWorkingDirsGetter([this]() { return workingDirs(); });
+    // Give SessionPrompt access to all snapshot managers
+    m_prompt->setSnapshotsGetter([this]() -> std::vector<SnapshotManager*> {
+        std::vector<SnapshotManager*> result;
+        for (auto &s : m_snapshots) result.push_back(s.get());
+        return result;
+    });
     setupRoutes();
 }
 
 Server::~Server()
 {
     stop();
+    cleanupAllSnapshots();
 }
 
 // ---- Lifecycle ----
@@ -769,6 +778,9 @@ void Server::setupRoutes()
     m_httpServer.Post(R"(/api/session/([^/]+)/revert/commit)", [this](const httplib::Request &req, httplib::Response &res) {
         handleRevertCommit(req, res);
     });
+    m_httpServer.Post(R"(/api/session/([^/]+)/changes/confirm)", [this](const httplib::Request &req, httplib::Response &res) {
+        handleConfirmChanges(req, res);
+    });
 
     // Session messages & context
     m_httpServer.Get(R"(/api/session/([^/]+)/message)", [this](const httplib::Request &req, httplib::Response &res) {
@@ -1167,6 +1179,11 @@ void Server::handleDeleteSession(const httplib::Request &req, httplib::Response 
         middleware::sendError(res, 404, "Session not found: " + id);
         return;
     }
+
+    // After session deletion, check if any snapshot repos are no longer
+    // referenced by remaining sessions and clean them up.
+    cleanupOrphanSnapshots();
+
     bool isV2 = (req.path.rfind("/api/", 0) == 0);
     if (isV2) {
         middleware::sendDataWrapped(res, json(true), 200);
@@ -1232,6 +1249,23 @@ void Server::handleSetWorkingDirs(const httplib::Request &req, httplib::Response
         m_workingDirs = dirs;
     }
 
+    // Rebuild per-directory SnapshotManagers.  SessionPrompt accesses them
+    // through a callback (setSnapshotsGetter), so recreating the unique_ptrs
+    // here is safe — no dangling raw pointers.
+    {
+        // Cleanup old snapshot repos before rebuilding
+        for (auto &s : m_snapshots) {
+            s->cleanup();
+        }
+        m_snapshots.clear();
+
+        std::string dataDir = m_config.getString("data_dir", ".");
+        for (const auto &d : dirs) {
+            m_snapshots.push_back(std::make_unique<SnapshotManager>(dataDir, d));
+            LOG_INFO("[Server] SnapshotManager created for worktree: " + d);
+        }
+    }
+
     LOG_INFO("[Server] setWorkingDirs: " + std::to_string(dirs.size()) + " dirs");
 
     json result;
@@ -1256,6 +1290,78 @@ std::vector<std::string> Server::workingDirs() const
     auto *self = const_cast<Server*>(this);
     std::lock_guard<std::mutex> lock(self->m_workingDirsMutex);
     return m_workingDirs;
+}
+
+SnapshotManager *Server::primarySnapshot()
+{
+    if (m_snapshots.empty()) return nullptr;
+    return m_snapshots[0].get();
+}
+
+SnapshotManager *Server::snapshotFor(const std::string &absPath)
+{
+    // Find the SnapshotManager whose worktree is the longest prefix of absPath.
+    // This routes a file to the correct per-directory snapshot.
+    std::string normalized = absPath;
+    std::replace(normalized.begin(), normalized.end(), '\\', '/');
+
+    SnapshotManager *best = nullptr;
+    size_t bestLen = 0;
+    for (auto &s : m_snapshots) {
+        std::string wt = s->worktree();
+        std::replace(wt.begin(), wt.end(), '\\', '/');
+        if (normalized.find(wt) == 0 && wt.size() > bestLen) {
+            best = s.get();
+            bestLen = wt.size();
+        }
+    }
+    return best ? best : primarySnapshot();
+}
+
+void Server::cleanupAllSnapshots()
+{
+    for (auto &s : m_snapshots) {
+        s->cleanup();
+    }
+    LOG_INFO("All snapshot repos cleaned up");
+}
+
+bool Server::isWorktreeReferenced(const std::string &worktree, const std::string &excludeSessionId)
+{
+    // Scan all sessions (except excluded) for snapshot data referencing this worktree
+    std::string normalized = worktree;
+    std::replace(normalized.begin(), normalized.end(), '\\', '/');
+
+    auto allSessions = m_sessionMgr.listSessions(1000);
+    for (const auto &sinfo : allSessions) {
+        if (sinfo.id == excludeSessionId) continue;
+        auto messages = m_sessionMgr.getMessages(sinfo.id, 10000);
+        for (const auto &msg : messages) {
+            for (const auto &part : msg.parts) {
+                if ((part.type == "step-start" || part.type == "step-finish")
+                    && part.data.contains("snapshot") && part.data["snapshot"].is_object()) {
+                    for (const auto &[key, val] : part.data["snapshot"].items()) {
+                        std::string k = key;
+                        std::replace(k.begin(), k.end(), '\\', '/');
+                        if (k == normalized) return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+void Server::cleanupOrphanSnapshots(const std::string &excludeSessionId)
+{
+    for (auto it = m_snapshots.begin(); it != m_snapshots.end(); ) {
+        auto &sm = *it;
+        if (!isWorktreeReferenced(sm->worktree(), excludeSessionId)) {
+            LOG_INFO("Snapshot orphan cleanup: removing " + sm->repoPath());
+            sm->cleanup();
+        }
+        ++it;
+    }
 }
 
 void Server::handleListMessages(const httplib::Request &req, httplib::Response &res)
@@ -1891,14 +1997,21 @@ void Server::handleForkSession(const httplib::Request &req, httplib::Response &r
 void Server::handleRevert(const httplib::Request &req, httplib::Response &res)
 {
     std::string sessionId = Router::segment(req.path, 2);
-
     auto *session = m_sessionMgr.getSession(sessionId);
     if (!session) {
         middleware::sendError(res, 404, "Session not found: " + sessionId);
         return;
     }
-
-    if (!m_snapshot || !m_snapshot->isInitialized()) {
+    if (m_sessionMgr.isBusy(sessionId)) {
+        middleware::sendError(res, 409, "Session is busy");
+        return;
+    }
+    // Check if changes have been confirmed (locked in)
+    if (session->metadata.value("changesConfirmed", false)) {
+        middleware::sendError(res, 403, "Changes have been confirmed and cannot be reverted");
+        return;
+    }
+    if (!primarySnapshot() || !primarySnapshot()->isInitialized()) {
         middleware::sendError(res, 503, "Snapshot system not available (git required)");
         return;
     }
@@ -1908,95 +2021,218 @@ void Server::handleRevert(const httplib::Request &req, httplib::Response &res)
         middleware::sendError(res, 400, "Invalid JSON body");
         return;
     }
-
     std::string messageId = body.value("messageID", "");
     if (messageId.empty()) {
         middleware::sendError(res, 400, "Missing 'messageID' in request body");
         return;
     }
 
-    // Get the snapshot hash from the message data
-    auto *msg = m_sessionMgr.getMessage(sessionId, messageId);
-    if (!msg) {
+    // Get all messages for this session
+    auto messages = m_sessionMgr.getMessages(sessionId, 10000);
+
+    // Find the target message index
+    int targetIdx = -1;
+    for (int i = 0; i < (int)messages.size(); i++) {
+        if (messages[i].id == messageId) { targetIdx = i; break; }
+    }
+    if (targetIdx < 0) {
         middleware::sendError(res, 404, "Message not found: " + messageId);
         return;
     }
 
-    std::string snapshotHash = msg->data.value("snapshotHash", "");
-    if (snapshotHash.empty()) {
-        middleware::sendError(res, 400, "No snapshot hash found for message: " + messageId);
-        return;
+    // Collect file entries from patch parts of all messages AFTER the target.
+    // New multi-directory patch format: {files: [{file: absPath, hash: treeHash}]}
+    struct FileEntry { std::string file; std::string hash; };
+    std::vector<FileEntry> allEntries;
+    std::set<std::string> seenFiles;
+    for (int i = targetIdx + 1; i < (int)messages.size(); i++) {
+        const auto &msg = messages[i];
+        if (msg.role != MessageRole::Assistant) continue;
+        bool hasSnap = false;
+        for (const auto &part : msg.parts) {
+            if (part.type == "step-start" && part.data.contains("snapshot")) {
+                hasSnap = true; break;
+            }
+        }
+        if (!hasSnap) continue;
+        for (const auto &part : msg.parts) {
+            if (part.type != "patch") continue;
+            if (!part.data.contains("files") || !part.data["files"].is_array()) continue;
+            for (const auto &f : part.data["files"]) {
+                std::string fp = f.value("file", "");
+                std::string fh = f.value("hash", "");
+                if (fp.empty() || fh.empty()) continue;
+                if (seenFiles.insert(fp).second) {
+                    allEntries.push_back({fp, fh});
+                }
+            }
+        }
     }
 
-    // Perform the restore
-    if (!m_snapshot->restore(snapshotHash)) {
-        middleware::sendError(res, 500, "Failed to restore snapshot: " + snapshotHash);
-        return;
+    // Group entries by owning SnapshotManager (probed via hasTree)
+    std::map<SnapshotManager*, std::vector<SnapshotPatch>> grouped;
+    std::map<std::string, SnapshotManager*> hashOwner;
+    for (const auto &e : allEntries) {
+        SnapshotManager *owner = nullptr;
+        auto it = hashOwner.find(e.hash);
+        if (it != hashOwner.end()) {
+            owner = it->second;
+        } else {
+            for (auto &s : m_snapshots) {
+                if (s->hasTree(e.hash)) { owner = s.get(); break; }
+            }
+            hashOwner[e.hash] = owner;
+        }
+        if (!owner) continue;
+        auto &patches = grouped[owner];
+        if (patches.empty() || patches.back().hash != e.hash) {
+            patches.push_back({e.hash, {}});
+        }
+        patches.back().files.push_back(e.file);
     }
 
-    // v1 semantics: revert publishes session.diff carrying the changes being
-    // backed out — from the message's step-start snapshot to its last recorded
-    // step-finish snapshot. Both are tree objects, so the diff is still
-    // computable after the restore ran.
-    std::string toHash;
-    for (const auto &p : msg->parts) {
-        if (p.type == "step-finish") toHash = p.data.value("snapshot", "");
+    // Save current state of all snapshots for potential unrevert (multi-hash)
+    json originalSnapshots = json::object();
+    for (auto &s : m_snapshots) {
+        if (!s || !s->isInitialized()) continue;
+        std::string h = s->track();
+        if (!h.empty()) {
+            std::string wt = s->worktree();
+            std::replace(wt.begin(), wt.end(), '\\', '/');
+            originalSnapshots[wt] = h;
+        }
     }
-    json diffs = toHash.empty() ? json::array() : m_snapshot->diffFull(snapshotHash, toHash);
 
-    // Track the revert state in session metadata (v1 shape: summary with
-    // additions/deletions/files totals)
+    // Revert patches via their owning managers
+    for (auto &[mgr, patches] : grouped) {
+        mgr->revertPatches(patches);
+    }
+
+    // Compute diff for each directory after revert
+    json diffs = json::array();
+    for (auto &s : m_snapshots) {
+        if (!s || !s->isInitialized()) continue;
+        std::string wt = s->worktree();
+        std::replace(wt.begin(), wt.end(), '\\', '/');
+        if (!originalSnapshots.contains(wt)) continue;
+        std::string beforeHash = originalSnapshots[wt].get<std::string>();
+        std::string afterHash = s->track();
+        if (beforeHash.empty() || afterHash.empty()) continue;
+        auto dirDiffs = s->diffFull(beforeHash, afterHash);
+        for (auto &d : dirDiffs) diffs.push_back(d);
+    }
+
+    // Publish session.diff (v1: shows the changes being backed out)
+    m_events.publish(EventType::SessionDiff, {
+        {"sessionID", sessionId},
+        {"diff", diffs}
+    });
+
+    // Store revert state in session metadata (v1 shape)
     int64_t additions = 0, deletions = 0;
     for (const auto &d : diffs) {
         additions += d.value("additions", 0);
         deletions += d.value("deletions", 0);
     }
     json revertInfo = json::object({
-        {"revertedMessageID", messageId},
-        {"snapshotHash", snapshotHash},
-        {"timeReverted", util::nowMs()},
+        {"messageID", messageId},
+        {"snapshot", originalSnapshots},
+        {"diff", diffs},
         {"summary", json::object({
             {"additions", additions},
             {"deletions", deletions},
-            {"files", diffs.size()}
+            {"files", (int)diffs.size()}
         })}
     });
     m_sessionMgr.updateSession(sessionId, {{"metadata.revert", revertInfo}});
 
-    m_events.publish(EventType::SessionDiff, {
+    // Publish session.revert event
+    m_events.publish(EventType::SessionRevert, {
         {"sessionID", sessionId},
-        {"diff", diffs}
+        {"revert", revertInfo}
     });
 
-    middleware::sendJSON(res, json::object({{"ok", true}, {"snapshotHash", snapshotHash}, {"diff", diffs}}).dump(), 200);
+    middleware::sendJSON(res, json::object({
+        {"ok", true},
+        {"snapshotHash", originalSnapshots},
+        {"diff", diffs},
+        {"summary", revertInfo["summary"]}
+    }).dump(), 200);
 }
 
 void Server::handleUnrevert(const httplib::Request &req, httplib::Response &res)
 {
     std::string sessionId = Router::segment(req.path, 2);
-
     auto *session = m_sessionMgr.getSession(sessionId);
     if (!session) {
         middleware::sendError(res, 404, "Session not found: " + sessionId);
         return;
     }
-
-    if (!m_snapshot || !m_snapshot->isInitialized()) {
+    if (m_sessionMgr.isBusy(sessionId)) {
+        middleware::sendError(res, 409, "Session is busy");
+        return;
+    }
+    if (!primarySnapshot() || !primarySnapshot()->isInitialized()) {
         middleware::sendError(res, 503, "Snapshot system not available");
         return;
     }
 
-    // Track current state to restore back
-    std::string currentHash = m_snapshot->track();
-    if (currentHash.empty()) {
-        middleware::sendError(res, 500, "Failed to track current state");
+    // Read revert state from session metadata
+    json revertInfo = session->metadata.value("revert", json(nullptr));
+    if (revertInfo.is_null() || !revertInfo.contains("snapshot")) {
+        // No revert state — nothing to undo
+        middleware::sendJSON(res, json::object({{"ok", true}}).dump(), 200);
         return;
+    }
+
+    // savedSnapshots is a JSON object {worktree: hash} (multi-directory)
+    const json &savedSnapshots = revertInfo["snapshot"];
+    if (savedSnapshots.is_null() || savedSnapshots.empty()) {
+        middleware::sendJSON(res, json::object({{"ok", true}}).dump(), 200);
+        return;
+    }
+
+    // Restore each directory via its owning SnapshotManager
+    if (savedSnapshots.is_object()) {
+        for (auto &[wtKey, hashVal] : savedSnapshots.items()) {
+            std::string hash = hashVal.get<std::string>();
+            if (hash.empty()) continue;
+            // Find the manager that owns this hash
+            for (auto &s : m_snapshots) {
+                if (s->hasTree(hash)) {
+                    s->restore(hash);
+                    break;
+                }
+            }
+        }
     }
 
     // Clear revert metadata
     m_sessionMgr.updateSession(sessionId, {{"metadata.revert", json(nullptr)}});
 
-    middleware::sendJSON(res, json::object({{"ok", true}, {"snapshotHash", currentHash}}).dump(), 200);
+    // Recompute diffs (should be empty since we restored)
+    json diffs = json::array();
+    if (savedSnapshots.is_object()) {
+        for (auto &s : m_snapshots) {
+            if (!s || !s->isInitialized()) continue;
+            std::string wt = s->worktree();
+            std::replace(wt.begin(), wt.end(), '\\', '/');
+            if (!savedSnapshots.contains(wt)) continue;
+            std::string savedHash = savedSnapshots[wt].get<std::string>();
+            std::string afterHash = s->track();
+            if (savedHash.empty() || afterHash.empty()) continue;
+            auto dirDiffs = s->diffFull(savedHash, afterHash);
+            for (auto &d : dirDiffs) diffs.push_back(d);
+        }
+    }
+
+    // Publish session.diff to update IDE
+    m_events.publish(EventType::SessionDiff, {
+        {"sessionID", sessionId},
+        {"diff", diffs}
+    });
+
+    middleware::sendJSON(res, json::object({{"ok", true}}).dump(), 200);
 }
 
 void Server::handleDiff(const httplib::Request &req, httplib::Response &res)
@@ -2009,7 +2245,7 @@ void Server::handleDiff(const httplib::Request &req, httplib::Response &res)
         return;
     }
 
-    if (!m_snapshot || !m_snapshot->isInitialized()) {
+    if (!primarySnapshot() || !primarySnapshot()->isInitialized()) {
         middleware::sendError(res, 503, "Snapshot system not available");
         return;
     }
@@ -2035,12 +2271,32 @@ void Server::handleDiff(const httplib::Request &req, httplib::Response &res)
 
     // v1 summary.diff shape: [{file, patch, additions, deletions, status}]
     // computed from the message's step-start snapshot to its last recorded
-    // step-finish snapshot (the changes this message's steps made)
-    std::string toHash;
-    for (const auto &p : msg->parts) {
-        if (p.type == "step-finish") toHash = p.data.value("snapshot", "");
+    // step-finish snapshot (the changes this message's steps made).
+    // Multi-directory: step-finish "snapshot" is {worktree: hash}.
+    // Find the manager that owns snapshotHash, then get the matching toHash.
+    SnapshotManager *owner = nullptr;
+    for (auto &s : m_snapshots) {
+        if (s->hasTree(snapshotHash)) { owner = s.get(); break; }
     }
-    json result = toHash.empty() ? json::array() : m_snapshot->diffFull(snapshotHash, toHash);
+    if (!owner) {
+        middleware::sendJSON(res, json::array().dump(), 200);
+        return;
+    }
+
+    // Find the toHash for the same worktree from the step-finish multi-hash
+    std::string toHash;
+    std::string ownerWt = owner->worktree();
+    std::replace(ownerWt.begin(), ownerWt.end(), '\\', '/');
+    for (const auto &p : msg->parts) {
+        if (p.type != "step-finish" || !p.data.contains("snapshot")) continue;
+        const json &snap = p.data["snapshot"];
+        if (snap.is_object() && snap.contains(ownerWt)) {
+            toHash = snap[ownerWt].get<std::string>();
+        } else if (snap.is_string()) {
+            toHash = snap.get<std::string>();
+        }
+    }
+    json result = toHash.empty() ? json::array() : owner->diffFull(snapshotHash, toHash);
 
     middleware::sendJSON(res, result.dump(), 200);
 }
@@ -3791,6 +4047,19 @@ void Server::handleRevertStage(const httplib::Request &req, httplib::Response &r
         middleware::sendError(res, 404, "Session not found: " + sessionId);
         return;
     }
+    if (m_sessionMgr.isBusy(sessionId)) {
+        middleware::sendError(res, 409, "Session is busy");
+        return;
+    }
+    // Check if changes have been confirmed (locked in)
+    if (session->metadata.value("changesConfirmed", false)) {
+        middleware::sendError(res, 403, "Changes have been confirmed and cannot be reverted");
+        return;
+    }
+    if (!primarySnapshot() || !primarySnapshot()->isInitialized()) {
+        middleware::sendError(res, 503, "Snapshot system not available");
+        return;
+    }
     json body;
     if (!middleware::parseJSON(req, body)) {
         middleware::sendError(res, 400, "Invalid JSON body");
@@ -3801,13 +4070,133 @@ void Server::handleRevertStage(const httplib::Request &req, httplib::Response &r
         middleware::sendError(res, 400, "Missing 'messageID' in request body");
         return;
     }
-    // Stage the revert: track current snapshot state
-    std::string hash;
-    if (m_snapshot && m_snapshot->isInitialized()) {
-        hash = m_snapshot->track();
+
+    // Capture current state of all snapshots as the "original" (for undo)
+    json originalSnapshots = json::object();
+    for (auto &s : m_snapshots) {
+        if (!s || !s->isInitialized()) continue;
+        std::string h = s->track();
+        if (!h.empty()) {
+            std::string wt = s->worktree();
+            std::replace(wt.begin(), wt.end(), '\\', '/');
+            originalSnapshots[wt] = h;
+        }
     }
-    json state = json::object({{"hash", hash}, {"staged", !hash.empty()}});
-    middleware::sendDataWrapped(res, state, 200);
+    if (originalSnapshots.empty()) {
+        middleware::sendError(res, 500, "Failed to capture current snapshot");
+        return;
+    }
+
+    // Collect patches from messages after the target (same logic as handleRevert)
+    auto messages = m_sessionMgr.getMessages(sessionId, 10000);
+    int targetIdx = -1;
+    for (int i = 0; i < (int)messages.size(); i++) {
+        if (messages[i].id == messageId) { targetIdx = i; break; }
+    }
+    if (targetIdx < 0) {
+        middleware::sendError(res, 404, "Message not found: " + messageId);
+        return;
+    }
+
+    struct FileEntry { std::string file; std::string hash; };
+    std::vector<FileEntry> allEntries;
+    std::set<std::string> seenFiles;
+    for (int i = targetIdx + 1; i < (int)messages.size(); i++) {
+        const auto &msg = messages[i];
+        if (msg.role != MessageRole::Assistant) continue;
+        bool hasSnap = false;
+        for (const auto &part : msg.parts) {
+            if (part.type == "step-start" && part.data.contains("snapshot")) {
+                hasSnap = true; break;
+            }
+        }
+        if (!hasSnap) continue;
+        for (const auto &part : msg.parts) {
+            if (part.type != "patch") continue;
+            if (!part.data.contains("files") || !part.data["files"].is_array()) continue;
+            for (const auto &f : part.data["files"]) {
+                std::string fp = f.value("file", "");
+                std::string fh = f.value("hash", "");
+                if (fp.empty() || fh.empty()) continue;
+                if (seenFiles.insert(fp).second) {
+                    allEntries.push_back({fp, fh});
+                }
+            }
+        }
+    }
+
+    // Group entries by owning SnapshotManager
+    std::map<SnapshotManager*, std::vector<SnapshotPatch>> grouped;
+    std::map<std::string, SnapshotManager*> hashOwner;
+    for (const auto &e : allEntries) {
+        SnapshotManager *owner = nullptr;
+        auto it = hashOwner.find(e.hash);
+        if (it != hashOwner.end()) {
+            owner = it->second;
+        } else {
+            for (auto &s : m_snapshots) {
+                if (s->hasTree(e.hash)) { owner = s.get(); break; }
+            }
+            hashOwner[e.hash] = owner;
+        }
+        if (!owner) continue;
+        auto &patches = grouped[owner];
+        if (patches.empty() || patches.back().hash != e.hash) {
+            patches.push_back({e.hash, {}});
+        }
+        patches.back().files.push_back(e.file);
+    }
+
+    // Apply the revert (restore files to pre-change state)
+    for (auto &[mgr, patches] : grouped) {
+        mgr->revertPatches(patches);
+    }
+
+    // Compute diff: what changed between original and current (after revert)
+    json diffs = json::array();
+    for (auto &s : m_snapshots) {
+        if (!s || !s->isInitialized()) continue;
+        std::string wt = s->worktree();
+        std::replace(wt.begin(), wt.end(), '\\', '/');
+        if (!originalSnapshots.contains(wt)) continue;
+        std::string beforeHash = originalSnapshots[wt].get<std::string>();
+        std::string afterHash = s->track();
+        if (beforeHash.empty() || afterHash.empty()) continue;
+        auto dirDiffs = s->diffFull(beforeHash, afterHash);
+        for (auto &d : dirDiffs) diffs.push_back(d);
+    }
+
+    int64_t additions = 0, deletions = 0;
+    for (const auto &d : diffs) {
+        additions += d.value("additions", 0);
+        deletions += d.value("deletions", 0);
+    }
+
+    // Store revert state in session metadata
+    json revertInfo = json::object({
+        {"messageID", messageId},
+        {"snapshot", originalSnapshots},
+        {"diff", diffs},
+        {"summary", json::object({
+            {"additions", additions},
+            {"deletions", deletions},
+            {"files", (int)diffs.size()}
+        })}
+    });
+    m_sessionMgr.updateSession(sessionId, {{"metadata.revert", revertInfo}});
+
+    // Publish session.revert event (v1 staged event)
+    m_events.publish(EventType::SessionRevert, {
+        {"sessionID", sessionId},
+        {"revert", revertInfo}
+    });
+
+    middleware::sendJSON(res, json::object({
+        {"ok", true},
+        {"snapshot", originalSnapshots},
+        {"diff", diffs},
+        {"summary", revertInfo["summary"]}
+    }).dump(), 200);
 }
 
 void Server::handleRevertClear(const httplib::Request &req, httplib::Response &res)
@@ -3818,7 +4207,48 @@ void Server::handleRevertClear(const httplib::Request &req, httplib::Response &r
         middleware::sendError(res, 404, "Session not found: " + sessionId);
         return;
     }
-    // Clear staged revert: no-op stub until staged snapshot tracking is implemented
+    if (m_sessionMgr.isBusy(sessionId)) {
+        middleware::sendError(res, 409, "Session is busy");
+        return;
+    }
+    if (!primarySnapshot() || !primarySnapshot()->isInitialized()) {
+        middleware::sendNoContent(res);
+        return;
+    }
+
+    // Read revert state from session metadata
+    json revertInfo = session->metadata.value("revert", json(nullptr));
+    if (revertInfo.is_null() || !revertInfo.contains("snapshot")) {
+        middleware::sendNoContent(res);
+        return;
+    }
+
+    // savedSnapshots is a JSON object {worktree: hash} (multi-directory)
+    const json &savedSnapshots = revertInfo["snapshot"];
+
+    // Restore files to the original state (undo the staged revert)
+    if (savedSnapshots.is_object()) {
+        for (auto &[wtKey, hashVal] : savedSnapshots.items()) {
+            std::string hash = hashVal.get<std::string>();
+            if (hash.empty()) continue;
+            for (auto &s : m_snapshots) {
+                if (s->hasTree(hash)) {
+                    s->restore(hash);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Clear revert metadata
+    m_sessionMgr.updateSession(sessionId, {{"metadata.revert", json(nullptr)}});
+
+    // Publish session.diff with empty diff to reset IDE state
+    m_events.publish(EventType::SessionDiff, {
+        {"sessionID", sessionId},
+        {"diff", json::array()}
+    });
+
     middleware::sendNoContent(res);
 }
 
@@ -3830,9 +4260,76 @@ void Server::handleRevertCommit(const httplib::Request &req, httplib::Response &
         middleware::sendError(res, 404, "Session not found: " + sessionId);
         return;
     }
-    // Commit the staged revert: restore to tracked snapshot if available
-    // TODO: implement proper staged snapshot commit
+    if (m_sessionMgr.isBusy(sessionId)) {
+        middleware::sendError(res, 409, "Session is busy");
+        return;
+    }
+
+    // Read revert state from session metadata
+    json revertInfo = session->metadata.value("revert", json(nullptr));
+    if (revertInfo.is_null() || !revertInfo.contains("messageID")) {
+        middleware::sendNoContent(res);
+        return;
+    }
+
+    std::string messageId = revertInfo.value("messageID", "");
+    if (messageId.empty()) {
+        middleware::sendNoContent(res);
+        return;
+    }
+
+    // Truncate messages: delete the target message and all after it
+    // (same pattern as regenerateFromMessage but without returning user text)
+    auto messages = m_sessionMgr.getMessages(sessionId, 10000);
+    bool foundTarget = false;
+    std::vector<std::string> idsToDelete;
+    for (const auto &msg : messages) {
+        if (msg.id == messageId) foundTarget = true;
+        if (foundTarget) idsToDelete.push_back(msg.id);
+    }
+
+    if (!idsToDelete.empty()) {
+        for (const auto &msgId : idsToDelete) {
+            m_sessionMgr.deleteMessage(sessionId, msgId);
+        }
+        LOG_INFO("Revert commit: deleted " + std::to_string(idsToDelete.size()) +
+                 " messages from session " + sessionId);
+    }
+
+    // Clear revert metadata
+    m_sessionMgr.updateSession(sessionId, {{"metadata.revert", json(nullptr)}});
+
+    // Publish session.updated to notify IDE of message changes
+    m_events.publish(EventType::SessionUpdated, {
+        {"sessionID", sessionId},
+        {"info", session->toJson()}
+    });
+
     middleware::sendNoContent(res);
+}
+
+void Server::handleConfirmChanges(const httplib::Request &req, httplib::Response &res)
+{
+    std::string sessionId = Router::segment(req.path, sessionSegIdx(req));
+    auto *session = m_sessionMgr.getSession(sessionId);
+    if (!session) {
+        middleware::sendError(res, 404, "Session not found: " + sessionId);
+        return;
+    }
+    if (m_sessionMgr.isBusy(sessionId)) {
+        middleware::sendError(res, 409, "Session is busy");
+        return;
+    }
+
+    // Mark changes as confirmed. Once confirmed, revert is blocked until
+    // new changes are made by a subsequent prompt (which resets the flag).
+    m_sessionMgr.updateSession(sessionId, {{"metadata.changesConfirmed", true}});
+
+    // Also clear any pending revert state (files are in their current state)
+    m_sessionMgr.updateSession(sessionId, {{"metadata.revert", json(nullptr)}});
+
+    LOG_INFO("Changes confirmed for session " + sessionId);
+    middleware::sendJSON(res, json::object({{"ok", true}}).dump(), 200);
 }
 
 void Server::handleSessionContext(const httplib::Request &req, httplib::Response &res)

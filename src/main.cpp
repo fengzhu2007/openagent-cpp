@@ -19,6 +19,7 @@
 #include "tool/builtin/edit_tool.h"
 #include "tool/builtin/glob_tool.h"
 #include "tool/builtin/grep_tool.h"
+#include "tool/builtin/fetch_tool.h"
 #include "server/server.h"
 #include "util/httplib_client.h"
 
@@ -227,6 +228,7 @@ int main(int argc, char *argv[])
     toolRegistry.registerTool(std::make_unique<EditTool>());
     toolRegistry.registerTool(std::make_unique<GlobTool>());
     toolRegistry.registerTool(std::make_unique<GrepTool>());
+    toolRegistry.registerTool(std::make_unique<FetchTool>());
     LOG_INFO("Tools registered: " + std::to_string(toolRegistry.count()));
 
     // Start HTTP server

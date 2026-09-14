@@ -78,13 +78,20 @@ SessionPrompt::SessionPrompt(SessionManager &sessionMgr, ProviderRegistry &provi
                              PermissionManager *permission, SnapshotManager *snapshot,
                              AgentManager *agents, MemoryManager *memory)
     : m_sessionMgr(sessionMgr), m_providers(providers), m_tools(tools), m_events(events), m_config(config),
-      m_permission(permission), m_snapshot(snapshot), m_agents(agents), m_memory(memory)
+      m_permission(permission), m_agents(agents), m_memory(memory)
 {
+    // Note: snapshot parameter kept for API compat but no longer stored.
+    // Multi-directory snapshots are accessed via m_snapshotsGetter callback.
 }
 
 void SessionPrompt::setWorkingDirsGetter(std::function<std::vector<std::string>()> getter)
 {
     m_workingDirsGetter = std::move(getter);
+}
+
+void SessionPrompt::setSnapshotsGetter(std::function<std::vector<SnapshotManager*>()> getter)
+{
+    m_snapshotsGetter = std::move(getter);
 }
 
 void SessionPrompt::prompt(const std::string &sessionId, const std::string &userText,
@@ -864,24 +871,35 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
         request.toolChoice = "none";
     }
 
-    // Take a snapshot before LLM call (if snapshot system available)
-    std::string snapshotHash;
-    if (m_snapshot && m_snapshot->isInitialized()) {
-        snapshotHash = m_snapshot->track();
-        if (!snapshotHash.empty()) {
-            assistantMsg.data["snapshotHash"] = snapshotHash;
+    // Take a snapshot before LLM call (if snapshot system available).
+    // Multi-directory: track each working directory and store per-dir hashes.
+    auto snapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
+    json multiHash = json::object();
+    std::string primaryHash;
+    for (auto *sm : snapshots) {
+        if (!sm || !sm->isInitialized()) continue;
+        std::string h = sm->track();
+        if (!h.empty()) {
+            std::string wt = sm->worktree();
+            std::replace(wt.begin(), wt.end(), '\\', '/');
+            multiHash[wt] = h;
+            if (primaryHash.empty()) primaryHash = h;
         }
+    }
+    if (!primaryHash.empty()) {
+        assistantMsg.data["snapshotHash"] = primaryHash;
     }
 
     // Announce the step boundary (v1 semantics: every provider turn starts
-    // with a step-start part; the snapshot hash marks the pre-turn state)
+    // with a step-start part; the snapshot hash marks the pre-turn state).
+    // Multi-directory: "snapshot" is a JSON object {worktree: hash}.
     {
         Part stepStartPart;
         stepStartPart.id = util::uuid4();
         stepStartPart.messageId = assistantMsg.id;
         stepStartPart.sessionId = sessionId;
         stepStartPart.type = "step-start";
-        if (!snapshotHash.empty()) stepStartPart.data["snapshot"] = snapshotHash;
+        if (!multiHash.empty()) stepStartPart.data["snapshot"] = multiHash;
         stepStartPart.timeCreated = util::nowMs();
         stepStartPart.timeUpdated = stepStartPart.timeCreated;
         m_sessionMgr.addPart(stepStartPart);
@@ -912,6 +930,10 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
     // after the step's tools ran) is stamped onto it in recordStepEndState.
     Part lastStepFinishPart;
     bool stepFinishCreated = false;
+
+    // Accumulated tool call argument text per callID.
+    // ToolCallStart creates the entry, ToolCallDelta appends, ToolCallEnd consumes and erases.
+    std::map<std::string, std::string> toolCallAccum;
 
     // Retry loop for transient errors
     SessionRetry::Config retryCfg;
@@ -953,7 +975,7 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
                 stepStartPart.messageId = assistantMsg.id;
                 stepStartPart.sessionId = sessionId;
                 stepStartPart.type = "step-start";
-                if (!snapshotHash.empty()) stepStartPart.data["snapshot"] = snapshotHash;
+                if (!multiHash.empty()) stepStartPart.data["snapshot"] = multiHash;
                 stepStartPart.timeCreated = util::nowMs();
                 stepStartPart.timeUpdated = stepStartPart.timeCreated;
                 m_sessionMgr.addPart(stepStartPart);
@@ -973,6 +995,7 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
             toolCalls.clear();
             hasToolCalls = false;
             toolParts.clear();
+            toolCallAccum.clear();
             accumulatedReasoning.clear();
             stepFinishCreated = false;
             lastStepFinishPart = Part{};
@@ -1033,46 +1056,119 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
             break;
 
         case LLMEvent::ToolCallStart:
+        case LLMEvent::ToolCallDelta:
         case LLMEvent::ToolCallEnd:
-            if (event.type == LLMEvent::ToolCallEnd) {
-                // Drop calls without an id: they can never be matched to a
-                // tool result, would fail API replay (empty tool_call id)
-                // and would show up as unusable parts in the UI
-                if (event.toolCall.id.empty()) {
+        {
+            // Drop calls without an id: they can never be matched to a
+            // tool result, would fail API replay (empty tool_call id)
+            // and would show up as unusable parts in the UI
+            if (event.toolCall.id.empty()) {
+                if (event.type == LLMEvent::ToolCallEnd) {
                     LOG_WARN("Dropping tool call without id: " + event.toolCall.name);
-                    break;
                 }
-                toolCalls.push_back(event.toolCall);
-                hasToolCalls = true;
+                break;
+            }
 
-                // Create a tool part (opencode format: type="tool")
+            if (event.type == LLMEvent::ToolCallStart) {
+                // Create tool part immediately so the UI shows the tool bubble
+                // before the LLM finishes streaming the full arguments
                 Part toolPart;
                 toolPart.id = util::uuid4();
                 toolPart.messageId = assistantMsg.id;
                 toolPart.sessionId = sessionId;
                 toolPart.type = "tool";
-                // Arguments normally arrive pre-parsed from the stream
-                // parser; guard against raw string payloads anyway
-                json input = event.toolCall.arguments.is_string()
-                    ? parseToolArguments(event.toolCall.arguments.get<std::string>())
-                    : event.toolCall.arguments;
                 toolPart.data = json::object({
                     {"callID", event.toolCall.id},
                     {"tool", event.toolCall.name},
                     {"state", json::object({
                         {"status", "pending"},
-                        {"input", input}
+                        {"input", json::object()}
                     })}
                 });
                 toolPart.timeCreated = util::nowMs();
                 toolPart.timeUpdated = toolPart.timeCreated;
                 m_sessionMgr.addPart(toolPart);
                 toolParts[event.toolCall.id] = toolPart;
+                toolCallAccum[event.toolCall.id] = "";
+
+                LOG_INFO("Tool call start: " + event.toolCall.name +
+                         " (id=" + event.toolCall.id + ")");
+
+            } else if (event.type == LLMEvent::ToolCallDelta) {
+                // Accumulate argument text and update the tool part so the UI
+                // can show incremental progress (e.g. large file writes)
+                auto accumIt = toolCallAccum.find(event.toolCall.id);
+                if (accumIt != toolCallAccum.end()) {
+                    accumIt->second += event.text;
+                } else {
+                    toolCallAccum[event.toolCall.id] = event.text;
+                }
+
+                auto partIt = toolParts.find(event.toolCall.id);
+                if (partIt != toolParts.end()) {
+                    json input = parseToolArguments(toolCallAccum[event.toolCall.id]);
+                    partIt->second.data["state"] = json::object({
+                        {"status", "pending"},
+                        {"input", input}
+                    });
+                    partIt->second.timeUpdated = util::nowMs();
+                    m_sessionMgr.updatePart(partIt->second);
+                }
+
+            } else if (event.type == LLMEvent::ToolCallEnd) {
+                // Finalize: push to toolCalls for execution, update part with complete args
+                toolCalls.push_back(event.toolCall);
+                hasToolCalls = true;
+
+                // Parse final arguments (may have accumulated via Delta or arrive whole)
+                json input;
+                auto accumIt = toolCallAccum.find(event.toolCall.id);
+                if (accumIt != toolCallAccum.end()) {
+                    // Had deltas — parse accumulated text
+                    input = parseToolArguments(accumIt->second);
+                    toolCallAccum.erase(accumIt);
+                } else {
+                    // No deltas (single-shot from provider) — use arguments directly
+                    input = event.toolCall.arguments.is_string()
+                        ? parseToolArguments(event.toolCall.arguments.get<std::string>())
+                        : event.toolCall.arguments;
+                }
+
+                auto partIt = toolParts.find(event.toolCall.id);
+                if (partIt != toolParts.end()) {
+                    // Part already created by ToolCallStart — update with final args
+                    partIt->second.data["state"] = json::object({
+                        {"status", "pending"},
+                        {"input", input}
+                    });
+                    partIt->second.timeUpdated = util::nowMs();
+                    m_sessionMgr.updatePart(partIt->second);
+                } else {
+                    // Fallback: no ToolCallStart was received (shouldn't happen)
+                    Part toolPart;
+                    toolPart.id = util::uuid4();
+                    toolPart.messageId = assistantMsg.id;
+                    toolPart.sessionId = sessionId;
+                    toolPart.type = "tool";
+                    toolPart.data = json::object({
+                        {"callID", event.toolCall.id},
+                        {"tool", event.toolCall.name},
+                        {"state", json::object({
+                            {"status", "pending"},
+                            {"input", input}
+                        })}
+                    });
+                    toolPart.timeCreated = util::nowMs();
+                    toolPart.timeUpdated = toolPart.timeCreated;
+                    m_sessionMgr.addPart(toolPart);
+                    toolParts[event.toolCall.id] = toolPart;
+                }
 
                 LOG_INFO("Tool call received: " + event.toolCall.name +
                          " (id=" + event.toolCall.id + ")");
             }
             break;
+        }
 
         case LLMEvent::ReasoningDelta:
             // Align with opencode: reasoning streams as a regular part whose
@@ -1229,7 +1325,7 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
             // Finalize pending tool parts from the failed stream (v1 cleanup:
             // nothing may hang in the transcript when the round ends abnormally)
             finalizeInterruptedToolParts(sessionId, assistantMsg.id);
-            recordStepEndState(sessionId, assistantMsg.id, snapshotHash,
+            recordStepEndState(sessionId, assistantMsg.id, multiHash,
                                lastStepFinishPart, stepFinishCreated);
             m_events.publish(EventType::SessionError, {
                 {"sessionID", sessionId},
@@ -1269,7 +1365,7 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
     }
 
     // If no tool calls, we're done
-    recordStepEndState(sessionId, assistantMsg.id, snapshotHash,
+    recordStepEndState(sessionId, assistantMsg.id, multiHash,
                        lastStepFinishPart, stepFinishCreated);
     if (!hasToolCalls) {
         return false;
@@ -1400,51 +1496,123 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
 
     // v1 step-finish semantics: stamp the completed snapshot (taken after the
     // tools ran) and record a PatchPart when this step changed files
-    recordStepEndState(sessionId, assistantMsg.id, snapshotHash,
+    recordStepEndState(sessionId, assistantMsg.id, multiHash,
                        lastStepFinishPart, stepFinishCreated);
 
     return true;  // Tools were called, need another round
 }
 
 void SessionPrompt::recordStepEndState(const std::string &sessionId, const std::string &messageId,
-                                         const std::string &startSnapshot,
+                                         const json &startSnapshot,
                                          Part &stepFinishPart, bool stepFinishCreated)
 {
-    if (!m_snapshot || !m_snapshot->isInitialized()) return;
+    auto snapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
+    if (snapshots.empty()) return;
 
-    // v1 takes the completed snapshot after the step's tools have run, so the
-    // step-finish part records the post-turn tree state
-    std::string completedSnapshot = m_snapshot->track();
-    if (!completedSnapshot.empty() && stepFinishCreated &&
-        stepFinishPart.data.value("snapshot", "").empty()) {
-        stepFinishPart.data["snapshot"] = completedSnapshot;
+    // Track all directories for the step-finish snapshot (multi-hash JSON)
+    json completedMulti = json::object();
+    for (auto *sm : snapshots) {
+        if (!sm || !sm->isInitialized()) continue;
+        std::string h = sm->track();
+        if (!h.empty()) {
+            std::string wt = sm->worktree();
+            std::replace(wt.begin(), wt.end(), '\\', '/');
+            completedMulti[wt] = h;
+        }
+    }
+    if (!completedMulti.empty() && stepFinishCreated &&
+        !stepFinishPart.data.contains("snapshot")) {
+        stepFinishPart.data["snapshot"] = completedMulti;
         stepFinishPart.timeUpdated = util::nowMs();
         m_sessionMgr.updatePart(stepFinishPart);
     }
 
-    // v1 PatchPart: file changes this step made, keyed to the step-start
-    // snapshot. Emitted only when something actually changed.
-    if (startSnapshot.empty()) return;
-    auto entries = m_snapshot->patch(startSnapshot);
-    if (entries.empty()) return;
+    // Multi-directory PatchPart: for each directory, compare start vs current
+    // and collect changed files with their per-directory tree hash.
+    // Patch format: {files: [{file: absPath, hash: treeHash}]}
+    if (startSnapshot.empty() || !startSnapshot.is_object()) return;
 
-    json files = json::array();
-    for (const auto &e : entries) {
-        // v1 emits absolute, forward-slash paths
-        std::string abs = m_snapshot->worktree() + "/" + e.filePath;
-        std::replace(abs.begin(), abs.end(), '\\', '/');
-        files.push_back(abs);
+    json filesArr = json::array();
+    for (auto *sm : snapshots) {
+        if (!sm || !sm->isInitialized()) continue;
+        std::string wt = sm->worktree();
+        std::replace(wt.begin(), wt.end(), '\\', '/');
+        if (!startSnapshot.contains(wt)) continue;
+        std::string startHash = startSnapshot[wt].get<std::string>();
+        if (startHash.empty()) continue;
+
+        auto entries = sm->patch(startHash);
+        for (const auto &e : entries) {
+            std::string abs = wt + "/" + e.filePath;
+            std::replace(abs.begin(), abs.end(), '\\', '/');
+            filesArr.push_back(json::object({
+                {"file", abs},
+                {"hash", startHash}
+            }));
+        }
     }
+    if (filesArr.empty()) return;
 
     Part patchPart;
     patchPart.id = util::uuid4();
     patchPart.messageId = messageId;
     patchPart.sessionId = sessionId;
     patchPart.type = "patch";
-    patchPart.data = {{"hash", startSnapshot}, {"files", files}};
+    patchPart.data = {{"files", filesArr}};
     patchPart.timeCreated = util::nowMs();
     patchPart.timeUpdated = patchPart.timeCreated;
     m_sessionMgr.addPart(patchPart);
+}
+
+void SessionPrompt::publishFilesChanged(const std::string &sessionId,
+                                         const json &promptStartHashes)
+{
+    auto snapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
+    if (snapshots.empty() || promptStartHashes.empty() || !promptStartHashes.is_object())
+        return;
+
+    // For each directory, patch() stages current working-tree changes, writes
+    // a tree, and diffs it against the prompt-start tree — returning one
+    // PatchEntry per changed file with its status (added / modified / deleted).
+    json filesArr = json::array();
+    json diffArr = json::array();
+    for (auto *sm : snapshots) {
+        if (!sm || !sm->isInitialized()) continue;
+        std::string wt = sm->worktree();
+        std::replace(wt.begin(), wt.end(), '\\', '/');
+        if (!promptStartHashes.contains(wt)) continue;
+        std::string startHash = promptStartHashes[wt].get<std::string>();
+        if (startHash.empty()) continue;
+
+        auto entries = sm->patch(startHash);
+        for (const auto &e : entries) {
+            std::string abs = wt + "/" + e.filePath;
+            std::replace(abs.begin(), abs.end(), '\\', '/');
+            filesArr.push_back(json::object({
+                {"path", abs},
+                {"status", e.status}   // "added", "modified", "deleted"
+            }));
+        }
+
+        // Compute full diff (with additions/deletions/patch) for the IDE
+        // file-change popup. track() stages and writes the current tree,
+        // then diffFull compares against the prompt-start tree.
+        std::string currentHash = sm->track();
+        if (!currentHash.empty()) {
+            auto fullDiffs = sm->diffFull(startHash, currentHash);
+            for (auto &d : fullDiffs) diffArr.push_back(d);
+        }
+    }
+    if (filesArr.empty()) return;
+
+    m_events.publish(EventType::FilesChanged, json::object({
+        {"sessionID", sessionId},
+        {"files", filesArr},
+        {"diff", diffArr}
+    }));
+
+    LOG_INFO("Published files_changed for session " + sessionId +
+             ": " + std::to_string(filesArr.size()) + " files");
 }
 
 void SessionPrompt::finalizeInterruptedToolParts(const std::string &sessionId, const std::string &messageId)
@@ -1488,6 +1656,11 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
 
     // Set session to busy
     m_sessionMgr.setStatus(sessionId, SessionStatus::Busy);
+
+    // Reset the changes-confirmed flag so new changes can be reverted.
+    // The user must re-confirm after this prompt finishes if they want to
+    // lock in the new changes.
+    m_sessionMgr.updateSession(sessionId, {{"metadata.changesConfirmed", false}});
 
     // Add user message (v1 input parts when supplied, plain text otherwise)
     //LOG_INFO("[runPrompt] step 1: makeUserMessage");
@@ -1588,6 +1761,24 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
 
     int round = 0;
 
+    // Capture the file state BEFORE any LLM round runs.  Compared with the
+    // post-loop snapshot in publishFilesChanged so the IDE learns exactly
+    // which files this conversation turn added / modified / deleted.
+    // Multi-directory: track each working directory separately.
+    json promptStartHashes = json::object();
+    {
+        auto snapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
+        for (auto *sm : snapshots) {
+            if (!sm || !sm->isInitialized()) continue;
+            std::string h = sm->track();
+            if (!h.empty()) {
+                std::string wt = sm->worktree();
+                std::replace(wt.begin(), wt.end(), '\\', '/');
+                promptStartHashes[wt] = h;
+            }
+        }
+    }
+
     while (round < maxRounds) {
         // Check abort flag
         {
@@ -1598,6 +1789,8 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
                 // v1 cleanup: pending/running tool parts become interrupted
                 // errors instead of hanging in the transcript forever
                 finalizeInterruptedToolParts(sessionId, assistantMsg.id);
+                // Notify IDE about files changed so far (even on abort)
+                publishFilesChanged(sessionId, promptStartHashes);
                 m_sessionMgr.setStatus(sessionId, SessionStatus::Idle);
                 return;
             }
@@ -1670,6 +1863,9 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
 
     // Update assistant message with final data
     m_sessionMgr.addMessage(assistantMsg);  // UPDATE via INSERT OR REPLACE
+
+    // Notify IDE which files this conversation turn changed
+    publishFilesChanged(sessionId, promptStartHashes);
 
     // Set session back to idle
     m_sessionMgr.setStatus(sessionId, SessionStatus::Idle);

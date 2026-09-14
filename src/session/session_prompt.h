@@ -15,6 +15,7 @@
 #include <mutex>
 #include <atomic>
 #include <functional>
+#include <vector>
 
 // Core prompt loop: builds messages, calls LLM, executes tools, loops until done
 class SessionPrompt {
@@ -28,6 +29,10 @@ public:
 
     // Set a callback to get global working directories
     void setWorkingDirsGetter(std::function<std::vector<std::string>()> getter);
+
+    // Set a callback to get all SnapshotManagers (one per working directory).
+    // Replaces the single-SnapshotManager design for multi-directory support.
+    void setSnapshotsGetter(std::function<std::vector<SnapshotManager*>()> getter);
 
     // Run the prompt loop synchronously (blocks until LLM finishes all tool rounds).
     // inputParts is the opencode v1 parts array (text/file); empty means plain text.
@@ -57,9 +62,18 @@ private:
     // Record the end-of-step snapshot state (v1 semantics): stamp the
     // completed snapshot onto the step-finish part and persist a PatchPart
     // when the step changed files. Called after the step's tools ran.
+    // startSnapshot is now a JSON object {worktree: hash} for multi-directory.
     void recordStepEndState(const std::string &sessionId, const std::string &messageId,
-                             const std::string &startSnapshot,
+                             const json &startSnapshot,
                              Part &stepFinishPart, bool stepFinishCreated);
+
+    // Compare the prompt-start snapshot with the current file state and
+    // publish a session.files_changed event listing every added / modified /
+    // deleted file.  Called once when the prompt loop exits so the IDE can
+    // refresh its editors without monitoring the entire filesystem.
+    // promptStartHashes is a JSON object {worktree: hash} for multi-directory.
+    void publishFilesChanged(const std::string &sessionId,
+                             const json &promptStartHashes);
 
     // Build chat messages from session history for the provider
     std::vector<ChatMessage> buildChatMessages(const std::string &sessionId);
@@ -108,12 +122,15 @@ private:
     EventBus &m_events;
     Config &m_config;
     PermissionManager *m_permission = nullptr;
-    SnapshotManager *m_snapshot = nullptr;
     AgentManager *m_agents = nullptr;
     MemoryManager *m_memory = nullptr;
 
     // Callback to get global working directories
     std::function<std::vector<std::string>()> m_workingDirsGetter;
+
+    // Callback to get all SnapshotManagers (one per working directory).
+    // Replaces the single m_snapshot pointer for multi-directory support.
+    std::function<std::vector<SnapshotManager*>()> m_snapshotsGetter;
 
     // Track running prompt threads per session
     mutable std::mutex m_threadsMutex;

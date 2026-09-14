@@ -246,6 +246,7 @@ private:
     void handleRevertStage(const httplib::Request &req, httplib::Response &res);
     void handleRevertClear(const httplib::Request &req, httplib::Response &res);
     void handleRevertCommit(const httplib::Request &req, httplib::Response &res);
+    void handleConfirmChanges(const httplib::Request &req, httplib::Response &res);
     void handleSessionContext(const httplib::Request &req, httplib::Response &res);
     void handleSessionHistory(const httplib::Request &req, httplib::Response &res);
     void handleSessionEventStream(const httplib::Request &req, httplib::Response &res);
@@ -275,6 +276,16 @@ private:
     void handleProjectCopyRemove(const httplib::Request &req, httplib::Response &res);
     void handleProjectCopyRefresh(const httplib::Request &req, httplib::Response &res);
 
+    // Snapshot helpers: find the right SnapshotManager for a given path,
+    // or get the first available one for session-level operations.
+    SnapshotManager *snapshotFor(const std::string &absPath);
+    SnapshotManager *primarySnapshot();
+
+    // Snapshot cleanup: delete bare repos from disk.
+    void cleanupAllSnapshots();
+    bool isWorktreeReferenced(const std::string &worktree, const std::string &excludeSessionId = "");
+    void cleanupOrphanSnapshots(const std::string &excludeSessionId = "");
+
     // CORS preflight handler
     void handleOptions(const httplib::Request &req, httplib::Response &res);
 
@@ -295,7 +306,7 @@ private:
     std::unique_ptr<SSEManager> m_sse;
     std::unique_ptr<AuthManager> m_auth;
     std::unique_ptr<PermissionManager> m_permission;
-    std::unique_ptr<SnapshotManager> m_snapshot;
+    std::vector<std::unique_ptr<SnapshotManager>> m_snapshots;
     std::unique_ptr<CommandManager> m_commands;
     std::unique_ptr<AgentManager> m_agents;
     std::unique_ptr<McpService> m_mcp;
