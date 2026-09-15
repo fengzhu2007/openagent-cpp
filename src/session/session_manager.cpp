@@ -375,11 +375,20 @@ Message *SessionManager::getMessage(const std::string &sessionId, const std::str
     return &cached;
 }
 
-std::vector<Message> SessionManager::getMessages(const std::string &sessionId, int limit)
+std::vector<Message> SessionManager::getMessages(const std::string &sessionId, int limit, int64_t beforeTimestamp)
 {
-    auto rows = m_db.query(
-        "SELECT * FROM message WHERE session_id = ? ORDER BY time_created ASC LIMIT ?",
-        {sessionId, limit});
+    std::vector<std::string> params;
+    std::string sql;
+    if (beforeTimestamp > 0) {
+        // Older page: messages with time_created < beforeTimestamp, newest first within the limit
+        sql = "SELECT * FROM message WHERE session_id = ? AND time_created < ? ORDER BY time_created ASC LIMIT ?";
+        params = {sessionId, std::to_string(beforeTimestamp), std::to_string(limit)};
+    } else {
+        // First page: get the LATEST messages (subquery picks last N, outer re-sorts ascending)
+        sql = "SELECT * FROM (SELECT * FROM message WHERE session_id = ? ORDER BY time_created DESC LIMIT ?) ORDER BY time_created ASC";
+        params = {sessionId, std::to_string(limit)};
+    }
+    auto rows = m_db.query(sql, params);
 
     std::vector<Message> result;
     for (const auto &row : rows) {

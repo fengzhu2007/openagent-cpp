@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(opencode-cpp LANGUAGES C CXX)
+project(openagent-cpp LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -178,39 +178,48 @@ else()
 endif()
 
 # ---- Executable ----
-add_executable(opencode-cpp ${OPENCODE_SOURCES} ${OPENCODE_HEADERS})
+add_executable(openagent-cpp ${OPENCODE_SOURCES} ${OPENCODE_HEADERS})
 
-target_include_directories(opencode-cpp PRIVATE
+target_include_directories(openagent-cpp PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
 # Link libraries
-target_link_libraries(opencode-cpp PRIVATE
+target_link_libraries(openagent-cpp PRIVATE
     curl_lib
 )
 
 # SQLite3 linking
-target_link_libraries(opencode-cpp PRIVATE sqlite3_lib)
+target_link_libraries(openagent-cpp PRIVATE sqlite3_lib)
 
 # Platform-specific
 if(WIN32)
-    target_link_libraries(opencode-cpp PRIVATE ws2_32)
-    target_compile_definitions(opencode-cpp PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    target_link_libraries(openagent-cpp PRIVATE ws2_32)
+    target_compile_definitions(openagent-cpp PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
     if(MSVC)
         # Ensure UTF-8 encoding for source files and string literals
-        target_compile_options(opencode-cpp PRIVATE /utf-8)
+        target_compile_options(openagent-cpp PRIVATE /utf-8)
     endif()
 endif()
 
 if(UNIX AND NOT APPLE)
-    target_link_libraries(opencode-cpp PRIVATE pthread)
+    target_link_libraries(openagent-cpp PRIVATE pthread)
 endif()
 
 # ---- Copy prompts/ directory to exe output dir after build ----
-add_custom_command(TARGET opencode-cpp POST_BUILD
+add_custom_command(TARGET openagent-cpp POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/prompts"
-        "$<TARGET_FILE_DIR:opencode-cpp>/prompts"
+        "$<TARGET_FILE_DIR:openagent-cpp>/prompts"
     COMMENT "Copying prompts/ to output directory"
+)
+
+# ---- Copy exe to AnyCode output dir after build ----
+# 见 App/panes/ai_chat/ai_chat_pane.cpp findServerExecutable()
+add_custom_command(TARGET openagent-cpp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:openagent-cpp>
+        $<TARGET_FILE_DIR:AnyCode>/openagent-cpp.exe
+    COMMENT "Copying openagent-cpp.exe to AnyCode output directory"
 )

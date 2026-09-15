@@ -89,7 +89,16 @@ private:
                          Message &assistantMsg,
                          Provider *provider, const std::string &model,
                          const Config::ModelConfig &modelCfg,
-                         std::vector<ChatMessage> &chatHistory);
+                         std::vector<ChatMessage> &chatHistory,
+                         json &promptStartHashes);
+
+    // Capture a baseline only for worktrees targeted by potentially mutating
+    // tool calls. Reuses one baseline for all writes in the same step.
+    void prepareToolSnapshots(const std::string &sessionDir,
+                              const std::vector<ToolCall> &toolCalls,
+                              json &stepStartHashes,
+                              json &promptStartHashes,
+                              Part &stepStartPart);
 
     // Execute a single tool call and return the result
     ToolResult executeToolCall(const std::string &sessionId, const std::string &sessionDir,

@@ -61,7 +61,49 @@ json OpenAIProvider::buildMessage(const ChatMessage &msg) const
     if (msg.role == "tool") {
         m["content"] = msg.content;
         m["tool_call_id"] = msg.toolCallId;
+    } else if (!msg.contentParts.empty()) {
+        // Multimodal content: build content array (OpenAI vision format)
+        json contentArr = json::array();
+        // Include plain text content alongside multimodal parts
+        if (!msg.content.empty()) {
+            json textPart;
+            textPart["type"] = "text";
+            textPart["text"] = msg.content;
+            contentArr.push_back(textPart);
+        }
+        for (const auto &cp : msg.contentParts) {
+            if (cp.type == "image") {
+                json imgPart;
+                imgPart["type"] = "image_url";
+                imgPart["image_url"] = {
+                    {"url", "data:" + cp.mime + ";base64," + cp.data}
+                };
+                contentArr.push_back(imgPart);
+            } else {
+                // text
+                json textPart;
+                textPart["type"] = "text";
+                textPart["text"] = cp.text;
+                contentArr.push_back(textPart);
+            }
+        }
+        m["content"] = contentArr;
+        if (!msg.toolCalls.empty()) {
+            json tools = json::array();
+            for (const auto &tc : msg.toolCalls) {
+                json t;
+                t["id"] = tc.id;
+                t["type"] = "function";
+                t["function"] = {
+                    {"name", tc.name},
+                    {"arguments", tc.arguments.is_string() ? tc.arguments.get<std::string>() : tc.arguments.dump()}
+                };
+                tools.push_back(t);
+            }
+            m["tool_calls"] = tools;
+        }
     } else {
+        // Plain text content
         // Assistant messages carrying only tool_calls use null content (standard);
         // fully-empty messages are skipped before reaching this point.
         if (!msg.content.empty()) {
@@ -114,7 +156,7 @@ json OpenAIProvider::buildRequestBody(const LLMRequest &request, bool streaming)
     for (const auto &msg : request.messages) {
         // Skip fully-empty messages (no content, no tool calls). Tool messages
         // are required by the tool_call protocol and are always kept.
-        if (msg.role != "tool" && msg.content.empty() && msg.toolCalls.empty()) {
+        if (msg.role != "tool" && msg.content.empty() && msg.toolCalls.empty() && msg.contentParts.empty()) {
             continue;
         }
         messages.push_back(buildMessage(msg));
@@ -182,7 +224,7 @@ void OpenAIProvider::stream(const LLMRequest &request, LLMEventCallback callback
     try {
         HttpClient::postStreaming(url, bodyStr, headers,
             [&parser](const std::string &chunk) {
-                LOG_INFO("[OpenAI] stream chunk received: " + chunk);
+                //LOG_INFO("[OpenAI] stream chunk received: " + chunk);
                 parser.feed(chunk);
             });
     } catch (const std::exception &e) {

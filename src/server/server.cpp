@@ -7,6 +7,7 @@
 #include "tool/builtin/shell_tool.h"
 #include "tool/builtin/shell_common.h"
 #include "tool/builtin/skill_tool.h"
+#include "tool/builtin/task_tool.h"
 #include <thread>
 #include <chrono>
 #include <queue>
@@ -169,6 +170,8 @@ Server::Server(const std::string &host, uint16_t port,
     m_skills->loadFromConfig(m_config.data());
     // Register SkillTool
     m_tools.registerTool(std::make_unique<SkillTool>(*m_skills));
+    // Register TaskTool (sub-task in child session; reads parent ID from thread-local)
+    m_tools.registerTool(std::make_unique<TaskTool>(m_sessionMgr, m_providers, m_tools, m_events, m_config));
     // Workspace, Sync, Project managers (D2-D4)
     m_workspaces = std::make_unique<WorkspaceManager>(m_db);
     m_sync = std::make_unique<SyncManager>(m_db, m_events);
@@ -1261,8 +1264,15 @@ void Server::handleSetWorkingDirs(const httplib::Request &req, httplib::Response
 
         std::string dataDir = m_config.getString("data_dir", ".");
         for (const auto &d : dirs) {
+            // The snapshot repo is an independent bare repo: git commands run
+            // with GIT_DIR pointing at the shadow repo and GIT_WORK_TREE at
+            // the project, so the project itself does NOT have to be a git
+            // repository. Gating on isGitRepo() here silently disabled
+            // files_changed for non-git projects (snapshot list stayed empty).
+            bool gitRepo = SnapshotManager::isGitRepo(d);
             m_snapshots.push_back(std::make_unique<SnapshotManager>(dataDir, d));
-            LOG_INFO("[Server] SnapshotManager created for worktree: " + d);
+            LOG_INFO(std::string("[Server] SnapshotManager created for worktree: ") + d +
+                     (gitRepo ? "" : " (not a git repo, shadow-repo tracking only)"));
         }
     }
 
@@ -1378,8 +1388,10 @@ void Server::handleListMessages(const httplib::Request &req, httplib::Response &
     bool isV2 = (req.path.rfind("/api/", 0) == 0);
     int limit = 100;
     if (req.has_param("limit")) limit = safeStoi(req.get_param_value("limit"));
+    int64_t beforeTimestamp = 0;
+    if (req.has_param("before")) beforeTimestamp = std::stoll(req.get_param_value("before"));
 
-    auto messages = m_sessionMgr.getMessages(sessionId, limit);
+    auto messages = m_sessionMgr.getMessages(sessionId, limit, beforeTimestamp);
     json result = json::array();
     for (const auto &msg : messages) {
         result.push_back(msg.toWithPartsJson());

@@ -34,12 +34,20 @@ public:
     // Check if git is available on the system
     bool isGitAvailable() const;
 
+    // Check if a directory is inside a git repository
+    static bool isGitRepo(const std::string &dir);
+
+    // Check if the worktree has uncommitted changes (lightweight:
+    // runs git status in the worktree, no snapshot repo needed)
+    bool hasChanges() const;
+
     // Check if the snapshot repo is initialized
     bool isInitialized() const;
 
-    // Track current file state: stages changes, writes tree, returns tree hash
-    // Returns empty string on failure
-    std::string track();
+    // Track current file state: stages changes, writes tree, returns tree hash.
+    // forceInitialize establishes a baseline even when the source repo is clean.
+    // Returns empty string on failure.
+    std::string track(bool forceInitialize = false);
 
     // Get the diff (list of changed files) between a snapshot hash and current state
     std::vector<PatchEntry> patch(const std::string &treeHash) const;

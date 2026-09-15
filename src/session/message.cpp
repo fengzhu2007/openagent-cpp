@@ -1,6 +1,84 @@
 #include "session/message.h"
 #include "provider/provider.h"
 #include "util/uuid.h"
+#include <fstream>
+#include <algorithm>
+#include <cctype>
+
+// Base64 encode binary data
+static std::string base64EncodeMsg(const std::vector<uint8_t> &data) {
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string result;
+    result.reserve(((data.size() + 2) / 3) * 4);
+    for (size_t i = 0; i < data.size(); i += 3) {
+        uint32_t n = static_cast<uint32_t>(data[i]) << 16;
+        if (i + 1 < data.size()) n |= static_cast<uint32_t>(data[i + 1]) << 8;
+        if (i + 2 < data.size()) n |= static_cast<uint32_t>(data[i + 2]);
+        result += table[(n >> 18) & 0x3F];
+        result += table[(n >> 12) & 0x3F];
+        result += (i + 1 < data.size()) ? table[(n >> 6) & 0x3F] : '=';
+        result += (i + 2 < data.size()) ? table[n & 0x3F] : '=';
+    }
+    return result;
+}
+
+// Detect MIME type from file extension
+static std::string detectMimeTypeMsg(const std::string &path) {
+    auto dot = path.rfind('.');
+    if (dot == std::string::npos) return "application/octet-stream";
+    std::string ext = path.substr(dot + 1);
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (ext == "png") return "image/png";
+    if (ext == "jpg" || ext == "jpeg") return "image/jpeg";
+    if (ext == "gif") return "image/gif";
+    if (ext == "webp") return "image/webp";
+    if (ext == "bmp") return "image/bmp";
+    if (ext == "svg") return "image/svg+xml";
+    if (ext == "txt") return "text/plain";
+    if (ext == "md") return "text/markdown";
+    if (ext == "json") return "application/json";
+    if (ext == "xml") return "application/xml";
+    if (ext == "pdf") return "application/pdf";
+    if (ext == "csv") return "text/csv";
+    if (ext == "html" || ext == "htm") return "text/html";
+    if (ext == "css") return "text/css";
+    if (ext == "js") return "application/javascript";
+    if (ext == "ts") return "application/typescript";
+    if (ext == "py") return "text/x-python";
+    if (ext == "cpp" || ext == "cc" || ext == "cxx") return "text/x-c++";
+    if (ext == "c") return "text/x-c";
+    if (ext == "h" || ext == "hpp") return "text/x-c";
+    if (ext == "java") return "text/x-java";
+    if (ext == "go") return "text/x-go";
+    if (ext == "rs") return "text/x-rust";
+    if (ext == "yaml" || ext == "yml") return "text/yaml";
+    if (ext == "toml") return "application/toml";
+    if (ext == "sh" || ext == "bash") return "text/x-shellscript";
+    if (ext == "log") return "text/plain";
+    return "application/octet-stream";
+}
+
+// Check if a MIME type is an image type supported by LLM vision
+static bool isVisionMimeMsg(const std::string &mime) {
+    return mime == "image/png" || mime == "image/jpeg" ||
+           mime == "image/gif" || mime == "image/webp" ||
+           mime == "image/bmp";
+}
+
+// Read entire file as binary
+static std::vector<uint8_t> readFileBinaryMsg(const std::string &path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return {};
+    f.seekg(0, std::ios::end);
+    auto size = f.tellg();
+    if (size <= 0) return {};
+    f.seekg(0, std::ios::beg);
+    std::vector<uint8_t> data(static_cast<size_t>(size));
+    f.read(reinterpret_cast<char*>(data.data()), size);
+    return data;
+}
 
 json Part::toJson() const
 {
@@ -336,12 +414,30 @@ Message makeUserMessageWithParts(const std::string &sessionId, const std::string
 
         if (input.value("type", "") == "file" && input.contains("url")) {
             part.type = "file";
+            std::string url = input.value("url", "");
+            std::string mime = input.value("mime", "");
+            if (mime.empty()) mime = detectMimeTypeMsg(url);
+
             part.data = {
-                {"mime", input.value("mime", "")},
-                {"url", input.value("url", "")}
+                {"mime", mime},
+                {"url", url}
             };
             if (input.contains("filename")) part.data["filename"] = input["filename"];
             if (input.contains("source")) part.data["source"] = input["source"];
+
+            // Read and encode file content at creation time so it persists
+            // in the DB and is available for all subsequent chat rounds
+            // without re-reading from disk.
+            auto fileData = readFileBinaryMsg(url);
+            if (!fileData.empty()) {
+                if (isVisionMimeMsg(mime)) {
+                    part.data["content"] = base64EncodeMsg(fileData);
+                    part.data["encoding"] = "base64";
+                } else {
+                    part.data["content"] = std::string(fileData.begin(), fileData.end());
+                    part.data["encoding"] = "text";
+                }
+            }
         } else if (input.value("type", "") == "agent" && input.contains("name")) {
             // v1 AgentPartInput: steering the prompt at a named agent
             part.type = "agent";

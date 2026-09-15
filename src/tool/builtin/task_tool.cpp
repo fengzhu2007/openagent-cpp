@@ -1,13 +1,27 @@
 #include "tool/builtin/task_tool.h"
+#include "session/session_prompt.h"
 #include "util/logger.h"
 #include <chrono>
 #include <thread>
 
+// Thread-local session ID: set by executeToolCall() before each tool
+// so TaskTool can discover its parent session at execution time.
+static thread_local std::string t_currentToolSessionId;
+
+void setCurrentToolSessionId(const std::string &sessionId)
+{
+    t_currentToolSessionId = sessionId;
+}
+
+std::string getCurrentToolSessionId()
+{
+    return t_currentToolSessionId;
+}
+
 TaskTool::TaskTool(SessionManager &sessionMgr, ProviderRegistry &providers,
-                   ToolRegistry &tools, EventBus &events, Config &config,
-                   const std::string &parentSessionId)
+                   ToolRegistry &tools, EventBus &events, Config &config)
     : m_sessionMgr(sessionMgr), m_providers(providers), m_tools(tools),
-      m_events(events), m_config(config), m_parentSessionId(parentSessionId)
+      m_events(events), m_config(config)
 {
 }
 
@@ -50,8 +64,11 @@ ToolResult TaskTool::execute(const json &args, const std::string &)
         return {false, "", "No prompt provided for the task", "task"};
     }
 
+    // Parent session ID is set by executeToolCall() via thread-local
+    std::string parentSessionId = t_currentToolSessionId;
+
     // Get parent session info for inheritance
-    SessionInfo *parentSession = m_sessionMgr.getSession(m_parentSessionId);
+    SessionInfo *parentSession = m_sessionMgr.getSession(parentSessionId);
     std::string directory = ".";
     std::string providerId;
     if (parentSession) {
@@ -71,7 +88,7 @@ ToolResult TaskTool::execute(const json &args, const std::string &)
     }
 
     // Set parent relationship
-    m_sessionMgr.updateSession(child.id, {{"parent_id", m_parentSessionId}});
+    m_sessionMgr.updateSession(child.id, {{"parent_id", parentSessionId}});
 
     LOG_INFO("Task tool: created child session " + child.id + " for task: " + description);
 

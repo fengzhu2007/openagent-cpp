@@ -14,6 +14,7 @@ struct McpServerConfig {
     std::unordered_map<std::string, std::string> env;
 };
 
+
 // MCP tool definition
 struct McpToolDef {
     std::string serverName;

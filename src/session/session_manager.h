@@ -70,7 +70,7 @@ public:
     // Message management
     Message addMessage(const Message &msg);
     Message *getMessage(const std::string &sessionId, const std::string &messageId);
-    std::vector<Message> getMessages(const std::string &sessionId, int limit = 100);
+    std::vector<Message> getMessages(const std::string &sessionId, int limit = 100, int64_t beforeTimestamp = 0);
     bool deleteMessage(const std::string &sessionId, const std::string &messageId);
 
     // Part management

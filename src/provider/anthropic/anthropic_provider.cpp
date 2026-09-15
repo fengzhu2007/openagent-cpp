@@ -107,12 +107,42 @@ std::pair<std::string, json> AnthropicProvider::buildMessages(const LLMRequest &
 
         // Regular user or assistant text message; skip fully-empty ones
         // (Anthropic rejects empty text content).
-        if (msg.content.empty()) {
+        if (msg.content.empty() && msg.contentParts.empty()) {
             continue;
         }
         json m;
         m["role"] = msg.role;
-        m["content"] = msg.content;
+        if (!msg.contentParts.empty()) {
+            // Multimodal: build content blocks array (Anthropic vision format)
+            json contentArr = json::array();
+            // Include plain text content alongside multimodal parts
+            if (!msg.content.empty()) {
+                json textBlock;
+                textBlock["type"] = "text";
+                textBlock["text"] = msg.content;
+                contentArr.push_back(textBlock);
+            }
+            for (const auto &cp : msg.contentParts) {
+                if (cp.type == "image") {
+                    json imgBlock;
+                    imgBlock["type"] = "image";
+                    imgBlock["source"] = {
+                        {"type", "base64"},
+                        {"media_type", cp.mime},
+                        {"data", cp.data}
+                    };
+                    contentArr.push_back(imgBlock);
+                } else {
+                    json textBlock;
+                    textBlock["type"] = "text";
+                    textBlock["text"] = cp.text;
+                    contentArr.push_back(textBlock);
+                }
+            }
+            m["content"] = contentArr;
+        } else {
+            m["content"] = msg.content;
+        }
         messages.push_back(m);
     }
 

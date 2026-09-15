@@ -1,18 +1,23 @@
 #pragma once
 #include "tool/tool.h"
 #include "session/session_manager.h"
-#include "session/session_prompt.h"
 #include "provider/provider_registry.h"
 #include "tool/tool_registry.h"
 #include "event/event_bus.h"
 #include "config/config.h"
 
-// Task tool: runs a sub-task in a child session synchronously
+// Set/get the session ID for the tool currently executing.
+// Called by SessionPrompt::executeToolCall() before each tool->execute().
+void setCurrentToolSessionId(const std::string &sessionId);
+std::string getCurrentToolSessionId();
+
+// Task tool: runs a sub-task in a child session synchronously.
+// Reads the parent session ID from the thread-local set via
+// setCurrentToolSessionId() (called by executeToolCall before each tool).
 class TaskTool : public Tool {
 public:
     TaskTool(SessionManager &sessionMgr, ProviderRegistry &providers,
-             ToolRegistry &tools, EventBus &events, Config &config,
-             const std::string &parentSessionId);
+             ToolRegistry &tools, EventBus &events, Config &config);
 
     std::string name() const override { return "task"; }
     std::string description() const override;
@@ -25,5 +30,4 @@ private:
     ToolRegistry &m_tools;
     EventBus &m_events;
     Config &m_config;
-    std::string m_parentSessionId;
 };

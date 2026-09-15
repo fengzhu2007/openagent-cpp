@@ -98,7 +98,7 @@ static size_t streamCaptureCallback(void *contents, size_t size, size_t nmemb, v
 {
     auto *ctx = static_cast<StreamCaptureCtx *>(userp);
     std::string chunk(static_cast<char *>(contents), size * nmemb);
-    LOG_INFO("[HTTP-Stream] chunk: " + chunk);
+    //LOG_INFO("[HTTP-Stream] chunk: " + chunk);
     (*ctx->callback)(chunk);
     if (ctx->responseBody) {
         *ctx->responseBody += chunk;

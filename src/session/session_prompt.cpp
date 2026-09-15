@@ -4,6 +4,7 @@
 #include "provider/cost.h"
 #include "tool/truncate.h"
 #include "tool/builtin/shell_common.h"
+#include "tool/builtin/task_tool.h"
 #include "util/uuid.h"
 #include "util/logger.h"
 #include <unordered_set>
@@ -11,6 +12,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <cctype>
+#include <fstream>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -71,6 +73,81 @@ static std::string sanitizeUtf8(const std::string &input) {
         i += bytes;
     }
     return result;
+}
+
+// Base64 encode binary data
+static std::string base64Encode(const std::vector<uint8_t> &data) {
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string result;
+    result.reserve(((data.size() + 2) / 3) * 4);
+    for (size_t i = 0; i < data.size(); i += 3) {
+        uint32_t n = static_cast<uint32_t>(data[i]) << 16;
+        if (i + 1 < data.size()) n |= static_cast<uint32_t>(data[i + 1]) << 8;
+        if (i + 2 < data.size()) n |= static_cast<uint32_t>(data[i + 2]);
+        result += table[(n >> 18) & 0x3F];
+        result += table[(n >> 12) & 0x3F];
+        result += (i + 1 < data.size()) ? table[(n >> 6) & 0x3F] : '=';
+        result += (i + 2 < data.size()) ? table[n & 0x3F] : '=';
+    }
+    return result;
+}
+
+// Detect MIME type from file extension
+static std::string detectMimeType(const std::string &path) {
+    auto dot = path.rfind('.');
+    if (dot == std::string::npos) return "application/octet-stream";
+    std::string ext = path.substr(dot + 1);
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (ext == "png") return "image/png";
+    if (ext == "jpg" || ext == "jpeg") return "image/jpeg";
+    if (ext == "gif") return "image/gif";
+    if (ext == "webp") return "image/webp";
+    if (ext == "bmp") return "image/bmp";
+    if (ext == "svg") return "image/svg+xml";
+    if (ext == "txt") return "text/plain";
+    if (ext == "md") return "text/markdown";
+    if (ext == "json") return "application/json";
+    if (ext == "xml") return "application/xml";
+    if (ext == "pdf") return "application/pdf";
+    if (ext == "csv") return "text/csv";
+    if (ext == "html" || ext == "htm") return "text/html";
+    if (ext == "css") return "text/css";
+    if (ext == "js") return "application/javascript";
+    if (ext == "ts") return "application/typescript";
+    if (ext == "py") return "text/x-python";
+    if (ext == "cpp" || ext == "cc" || ext == "cxx") return "text/x-c++";
+    if (ext == "c") return "text/x-c";
+    if (ext == "h" || ext == "hpp") return "text/x-c";
+    if (ext == "java") return "text/x-java";
+    if (ext == "go") return "text/x-go";
+    if (ext == "rs") return "text/x-rust";
+    if (ext == "yaml" || ext == "yml") return "text/yaml";
+    if (ext == "toml") return "application/toml";
+    if (ext == "sh" || ext == "bash") return "text/x-shellscript";
+    if (ext == "log") return "text/plain";
+    return "application/octet-stream";
+}
+
+// Check if a MIME type is an image type supported by LLM vision
+static bool isVisionMime(const std::string &mime) {
+    return mime == "image/png" || mime == "image/jpeg" ||
+           mime == "image/gif" || mime == "image/webp" ||
+           mime == "image/bmp";
+}
+
+// Read entire file as binary
+static std::vector<uint8_t> readFileBinary(const std::string &path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return {};
+    f.seekg(0, std::ios::end);
+    auto size = f.tellg();
+    if (size <= 0) return {};
+    f.seekg(0, std::ios::beg);
+    std::vector<uint8_t> data(static_cast<size_t>(size));
+    f.read(reinterpret_cast<char*>(data.data()), size);
+    return data;
 }
 
 SessionPrompt::SessionPrompt(SessionManager &sessionMgr, ProviderRegistry &providers,
@@ -235,13 +312,76 @@ std::vector<ChatMessage> SessionPrompt::buildChatMessages(const std::string &ses
                     if (!cm.content.empty()) cm.content += "\n";
                     cm.content += part.data["text"].get<std::string>();
                 } else if (part.type == "file") {
-                    // Providers here are text-only; surface the attachment as a
-                    // text annotation so the model at least knows a file was shared
-                    std::string label = part.data.value("filename", "");
-                    if (label.empty()) label = part.data.value("mime", "");
-                    if (!label.empty()) {
-                        if (!cm.content.empty()) cm.content += "\n";
-                        cm.content += "[Attachment: " + label + "]";
+                    // Build multimodal parts from file attachment.
+                    // Prefer pre-encoded content stored in the DB at message
+                    // creation time; fall back to reading from disk for
+                    // messages created before this optimisation.
+                    std::string url = part.data.value("url", "");
+                    std::string filename = part.data.value("filename", "");
+                    std::string mime = part.data.value("mime", "");
+                    std::string encoding = part.data.value("encoding", "");
+                    std::string storedContent = part.data.value("content", "");
+
+                    if (!storedContent.empty() && !encoding.empty()) {
+                        // Pre-encoded at creation time — use directly
+                        if (encoding == "base64") {
+                            ContentPart cp;
+                            cp.type = "image";
+                            cp.data = storedContent;
+                            cp.mime = mime.empty() ? "image/png" : mime;
+                            cm.contentParts.push_back(cp);
+                        } else {
+                            // text
+                            std::string label = filename.empty() ? url : filename;
+                            ContentPart cp;
+                            cp.type = "text";
+                            cp.text = "[File: " + label + "]\n" + storedContent;
+                            cm.contentParts.push_back(cp);
+                        }
+                    } else if (!url.empty()) {
+                        // Fallback: read from disk (old messages or missing content)
+                        if (mime.empty()) mime = detectMimeType(url);
+
+                        if (isVisionMime(mime)) {
+                            auto fileData = readFileBinary(url);
+                            if (!fileData.empty()) {
+                                ContentPart cp;
+                                cp.type = "image";
+                                cp.data = base64Encode(fileData);
+                                cp.mime = mime;
+                                cm.contentParts.push_back(cp);
+                            } else {
+                                std::string label = filename.empty() ? mime : filename;
+                                ContentPart cp;
+                                cp.type = "text";
+                                cp.text = "[Attachment: " + label + " (unreadable)]";
+                                cm.contentParts.push_back(cp);
+                            }
+                        } else {
+                            auto fileData = readFileBinary(url);
+                            if (!fileData.empty()) {
+                                std::string textContent(fileData.begin(), fileData.end());
+                                ContentPart cp;
+                                cp.type = "text";
+                                cp.text = "[File: " + (filename.empty() ? url : filename) + "]\n" + textContent;
+                                cm.contentParts.push_back(cp);
+                            } else {
+                                std::string label = filename.empty() ? mime : filename;
+                                ContentPart cp;
+                                cp.type = "text";
+                                cp.text = "[Attachment: " + label + " (unreadable)]";
+                                cm.contentParts.push_back(cp);
+                            }
+                        }
+                    } else {
+                        // No URL, no stored content — just annotate
+                        std::string label = filename.empty() ? mime : filename;
+                        if (!label.empty()) {
+                            ContentPart cp;
+                            cp.type = "text";
+                            cp.text = "[Attachment: " + label + "]";
+                            cm.contentParts.push_back(cp);
+                        }
                     }
                 } else if (part.type == "subtask") {
                     // v1 SubtaskPart: the sub-agent's prompt is the replayable text
@@ -425,6 +565,28 @@ static bool pathContains(const std::string &dirKey, const std::string &targetKey
     return dirKey.back() == '/' || targetKey[dirKey.size()] == '/';
 }
 
+static bool isSnapshotWriteTool(const std::string &name)
+{
+    return name == "write" || name == "edit" || name == "shell" ||
+           name == "cmd" || name == "powershell" || name == "task";
+}
+
+static SnapshotManager *snapshotForPath(const std::vector<SnapshotManager*> &snapshots,
+                                        const std::string &path)
+{
+    const std::string target = normalizePathKey(path);
+    SnapshotManager *result = nullptr;
+    size_t longest = 0;
+    for (auto *snapshot : snapshots) {
+        if (!snapshot || !snapshot->isInitialized()) continue;
+        std::string worktree = normalizePathKey(snapshot->worktree());
+        if (!pathContains(worktree, target) || worktree.size() <= longest) continue;
+        result = snapshot;
+        longest = worktree.size();
+    }
+    return result;
+}
+
 ToolResult SessionPrompt::executeToolCall(const std::string &sessionId, const std::string &sessionDir,
                                            const ToolCall &tc)
 {
@@ -537,8 +699,13 @@ ToolResult SessionPrompt::executeToolCall(const std::string &sessionId, const st
     }
 
     LOG_INFO("Executing tool: " + tc.name);
+    // Expose the session ID so session-aware tools (e.g. TaskTool)
+    // can discover their parent without a constructor param.
+    std::string prevSessionId = getCurrentToolSessionId();
+    setCurrentToolSessionId(sessionId);
     try {
         ToolResult result = tool->execute(args, toolCwd);
+        setCurrentToolSessionId(prevSessionId);
 
         // Truncate large tool outputs
         std::string dataDir = m_config.getString("data_dir", ".");
@@ -552,12 +719,59 @@ ToolResult SessionPrompt::executeToolCall(const std::string &sessionId, const st
 
         return result;
     } catch (const std::exception &e) {
+        setCurrentToolSessionId(prevSessionId);
         ToolResult r;
         r.success = false;
         r.error = std::string("Tool execution error: ") + e.what();
         r.title = "tool: " + tc.name;
         return r;
     }
+}
+
+void SessionPrompt::prepareToolSnapshots(const std::string &sessionDir,
+                                         const std::vector<ToolCall> &toolCalls,
+                                         json &stepStartHashes,
+                                         json &promptStartHashes,
+                                         Part &stepStartPart)
+{
+    auto snapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
+    if (snapshots.empty()) return;
+
+    for (const auto &toolCall : toolCalls) {
+        if (!isSnapshotWriteTool(toolCall.name)) continue;
+
+        std::string toolCwd = sessionDir;
+        if ((toolCwd.empty() || toolCwd == ".") && m_workingDirsGetter) {
+            auto dirs = m_workingDirsGetter();
+            if (!dirs.empty()) toolCwd = dirs[0];
+        }
+        if (toolCwd.empty()) continue;
+
+        std::string target = toolCwd;
+        if ((toolCall.name == "write" || toolCall.name == "edit") &&
+            toolCall.arguments.is_object() && toolCall.arguments.contains("path") &&
+            toolCall.arguments["path"].is_string()) {
+            target = resolvePath(toolCwd, toolCall.arguments["path"].get<std::string>());
+        }
+
+        SnapshotManager *snapshot = snapshotForPath(snapshots, target);
+        if (!snapshot) continue;
+        std::string worktree = snapshot->worktree();
+        std::replace(worktree.begin(), worktree.end(), '\\', '/');
+        if (stepStartHashes.contains(worktree)) continue;
+
+        LOG_INFO("[snapshot] preparing baseline for " + worktree + " before tool: " + toolCall.name);
+        std::string hash = snapshot->track(true);
+        if (hash.empty()) continue;
+
+        stepStartHashes[worktree] = hash;
+        if (!promptStartHashes.contains(worktree)) promptStartHashes[worktree] = hash;
+    }
+
+    if (stepStartHashes.empty()) return;
+    stepStartPart.data["snapshot"] = stepStartHashes;
+    stepStartPart.timeUpdated = util::nowMs();
+    m_sessionMgr.updatePart(stepStartPart);
 }
 
 bool SessionPrompt::checkAndCompact(std::vector<ChatMessage> &chatHistory, Provider *provider,
@@ -844,7 +1058,8 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
                                      Message &assistantMsg,
                                      Provider *provider, const std::string &model,
                                      const Config::ModelConfig &modelCfg,
-                                     std::vector<ChatMessage> &chatHistory)
+                                     std::vector<ChatMessage> &chatHistory,
+                                     json &promptStartHashes)
 {
     // Build LLM request
     LLMRequest request;
@@ -871,39 +1086,17 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
         request.toolChoice = "none";
     }
 
-    // Take a snapshot before LLM call (if snapshot system available).
-    // Multi-directory: track each working directory and store per-dir hashes.
-    auto snapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
+    // A step-start part is created before the provider response. Its snapshot
+    // is filled only if this step actually invokes a potentially writing tool.
     json multiHash = json::object();
-    std::string primaryHash;
-    for (auto *sm : snapshots) {
-        if (!sm || !sm->isInitialized()) continue;
-        std::string h = sm->track();
-        if (!h.empty()) {
-            std::string wt = sm->worktree();
-            std::replace(wt.begin(), wt.end(), '\\', '/');
-            multiHash[wt] = h;
-            if (primaryHash.empty()) primaryHash = h;
-        }
-    }
-    if (!primaryHash.empty()) {
-        assistantMsg.data["snapshotHash"] = primaryHash;
-    }
-
-    // Announce the step boundary (v1 semantics: every provider turn starts
-    // with a step-start part; the snapshot hash marks the pre-turn state).
-    // Multi-directory: "snapshot" is a JSON object {worktree: hash}.
-    {
-        Part stepStartPart;
-        stepStartPart.id = util::uuid4();
-        stepStartPart.messageId = assistantMsg.id;
-        stepStartPart.sessionId = sessionId;
-        stepStartPart.type = "step-start";
-        if (!multiHash.empty()) stepStartPart.data["snapshot"] = multiHash;
-        stepStartPart.timeCreated = util::nowMs();
-        stepStartPart.timeUpdated = stepStartPart.timeCreated;
-        m_sessionMgr.addPart(stepStartPart);
-    }
+    Part stepStartPart;
+    stepStartPart.id = util::uuid4();
+    stepStartPart.messageId = assistantMsg.id;
+    stepStartPart.sessionId = sessionId;
+    stepStartPart.type = "step-start";
+    stepStartPart.timeCreated = util::nowMs();
+    stepStartPart.timeUpdated = stepStartPart.timeCreated;
+    m_sessionMgr.addPart(stepStartPart);
 
     // State for this round
     std::string accumulatedText;
@@ -1384,6 +1577,11 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
     // write stays on this thread, so part ordering and the chatHistory
     // replay order stay deterministic.
 
+    prepareToolSnapshots(sessionDir, toolCalls, multiHash, promptStartHashes, stepStartPart);
+    if (!multiHash.empty()) {
+        assistantMsg.data["snapshotHash"] = multiHash.begin().value();
+    }
+
     // Phase 1: mark every tool part running (clients see queued → active).
     // Going through the in-round map (instead of rescanning recent messages
     // by callID) guarantees a callID the model re-issued updates its own part
@@ -1506,19 +1704,21 @@ void SessionPrompt::recordStepEndState(const std::string &sessionId, const std::
                                          const json &startSnapshot,
                                          Part &stepFinishPart, bool stepFinishCreated)
 {
+    if (startSnapshot.empty() || !startSnapshot.is_object()) return;
+
     auto snapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
     if (snapshots.empty()) return;
 
-    // Track all directories for the step-finish snapshot (multi-hash JSON)
+    // Only worktrees whose potentially writing tools captured a baseline need
+    // an end-of-step snapshot. Uninvolved projects perform no Git operations.
     json completedMulti = json::object();
     for (auto *sm : snapshots) {
         if (!sm || !sm->isInitialized()) continue;
+        std::string wt = sm->worktree();
+        std::replace(wt.begin(), wt.end(), '\\', '/');
+        if (!startSnapshot.contains(wt)) continue;
         std::string h = sm->track();
-        if (!h.empty()) {
-            std::string wt = sm->worktree();
-            std::replace(wt.begin(), wt.end(), '\\', '/');
-            completedMulti[wt] = h;
-        }
+        if (!h.empty()) completedMulti[wt] = h;
     }
     if (!completedMulti.empty() && stepFinishCreated &&
         !stepFinishPart.data.contains("snapshot")) {
@@ -1530,8 +1730,6 @@ void SessionPrompt::recordStepEndState(const std::string &sessionId, const std::
     // Multi-directory PatchPart: for each directory, compare start vs current
     // and collect changed files with their per-directory tree hash.
     // Patch format: {files: [{file: absPath, hash: treeHash}]}
-    if (startSnapshot.empty() || !startSnapshot.is_object()) return;
-
     json filesArr = json::array();
     for (auto *sm : snapshots) {
         if (!sm || !sm->isInitialized()) continue;
@@ -1584,6 +1782,13 @@ void SessionPrompt::publishFilesChanged(const std::string &sessionId,
         std::string startHash = promptStartHashes[wt].get<std::string>();
         if (startHash.empty()) continue;
 
+        // Stage the current working state FIRST: the index is only updated
+        // by track(), and changes from the final tool round never went
+        // through prepareToolSnapshots. patch()'s write-tree below would
+        // otherwise serialize a stale index and miss them (a file created
+        // in the last tool round would never be reported as "added").
+        std::string currentHash = sm->track();
+
         auto entries = sm->patch(startHash);
         for (const auto &e : entries) {
             std::string abs = wt + "/" + e.filePath;
@@ -1595,9 +1800,8 @@ void SessionPrompt::publishFilesChanged(const std::string &sessionId,
         }
 
         // Compute full diff (with additions/deletions/patch) for the IDE
-        // file-change popup. track() stages and writes the current tree,
-        // then diffFull compares against the prompt-start tree.
-        std::string currentHash = sm->track();
+        // file-change popup. diffFull compares currentHash (written by
+        // track() above) against the prompt-start tree.
         if (!currentHash.empty()) {
             auto fullDiffs = sm->diffFull(startHash, currentHash);
             for (auto &d : fullDiffs) diffArr.push_back(d);
@@ -1761,23 +1965,9 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
 
     int round = 0;
 
-    // Capture the file state BEFORE any LLM round runs.  Compared with the
-    // post-loop snapshot in publishFilesChanged so the IDE learns exactly
-    // which files this conversation turn added / modified / deleted.
-    // Multi-directory: track each working directory separately.
+    // Baselines are captured lazily when this prompt first invokes a
+    // potentially writing tool in a worktree. Uninvolved projects are skipped.
     json promptStartHashes = json::object();
-    {
-        auto snapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
-        for (auto *sm : snapshots) {
-            if (!sm || !sm->isInitialized()) continue;
-            std::string h = sm->track();
-            if (!h.empty()) {
-                std::string wt = sm->worktree();
-                std::replace(wt.begin(), wt.end(), '\\', '/');
-                promptStartHashes[wt] = h;
-            }
-        }
-    }
 
     while (round < maxRounds) {
         // Check abort flag
@@ -1799,7 +1989,7 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
         ++round;
         LOG_INFO("LLM round " + std::to_string(round) + " for session: " + sessionId);
 
-        bool toolsCalled = processLLMRound(sessionId, session->directory, assistantMsg, provider, model, modelCfg, chatHistory);
+        bool toolsCalled = processLLMRound(sessionId, session->directory, assistantMsg, provider, model, modelCfg, chatHistory, promptStartHashes);
 
         // Auto-generate title after first round if conditions are met
         if (round == 1 && session->parentId.empty() &&

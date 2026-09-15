@@ -54,12 +54,22 @@ struct LLMEvent {
 // Callback for streaming LLM events
 using LLMEventCallback = std::function<void(const LLMEvent &)>;
 
+// A content part within a chat message (text, image, etc.)
+// Used for multimodal messages (e.g. user sending an image file).
+struct ContentPart {
+    std::string type;   // "text", "image"
+    std::string text;   // for text parts
+    std::string data;   // base64-encoded data for image parts
+    std::string mime;   // MIME type for image parts (e.g. "image/png")
+};
+
 // Chat message for provider API
 struct ChatMessage {
     std::string role;    // "user", "assistant", "system", "tool"
     std::string content;
     std::vector<ToolCall> toolCalls;  // for assistant messages with tool calls
     std::string toolCallId;           // for tool result messages
+    std::vector<ContentPart> contentParts;  // multimodal content (text + images)
 };
 
 // Tool definition for the provider

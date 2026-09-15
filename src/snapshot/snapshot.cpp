@@ -52,6 +52,76 @@ bool SnapshotManager::isGitAvailable() const
     return result.find("git version") != std::string::npos;
 }
 
+bool SnapshotManager::isGitRepo(const std::string &dir)
+{
+    if (dir.empty()) return false;
+    // Use git rev-parse to check if the directory is inside a git repo.
+    // This works for regular repos, worktrees, and subdirectories.
+#ifdef _WIN32
+    std::string cmd = "cd /d \"" + dir + "\" && git rev-parse --git-dir 2>&1";
+#else
+    std::string cmd = "cd \"" + dir + "\" && git rev-parse --git-dir 2>&1";
+#endif
+    std::array<char, 1024> buffer;
+    std::string result;
+#ifdef _WIN32
+    FILE *pipe = _popen(cmd.c_str(), "r");
+#else
+    FILE *pipe = popen(cmd.c_str(), "r");
+#endif
+    if (!pipe) return false;
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
+        result += buffer.data();
+    }
+#ifdef _WIN32
+    int exitCode = _pclose(pipe);
+#else
+    int exitCode = pclose(pipe);
+#endif
+    // git rev-parse --git-dir exits 0 only inside a git repo
+    return exitCode == 0;
+}
+
+bool SnapshotManager::hasChanges() const
+{
+    if (m_worktree.empty()) return false;
+    LOG_INFO("[hasChanges] checking worktree=" + m_worktree);
+    // Check only tracked files for modifications (staged + unstaged).
+    // Untracked files are intentionally ignored — they don't represent
+    // meaningful changes for snapshot purposes.
+    // git diff --quiet: exit 0 = clean, exit 1 = has changes
+    // git diff --quiet --cached: exit 0 = no staged changes, exit 1 = has staged
+#ifdef _WIN32
+    std::string cmd = "cd /d \"" + m_worktree + "\" && (git diff --quiet 2>nul || git diff --quiet --cached 2>nul)";
+#else
+    std::string cmd = "cd \"" + m_worktree + "\" && (git diff --quiet 2>/dev/null || git diff --quiet --cached 2>/dev/null)";
+#endif
+    std::array<char, 1024> buffer;
+    std::string result;
+#ifdef _WIN32
+    FILE *pipe = _popen(cmd.c_str(), "r");
+#else
+    FILE *pipe = popen(cmd.c_str(), "r");
+#endif
+    if (!pipe) {
+        LOG_ERROR("[hasChanges] _popen failed for: " + m_worktree);
+        return false;
+    }
+    // Drain output (git diff --quiet produces no output, but just in case)
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
+        result += buffer.data();
+    }
+#ifdef _WIN32
+    int exitCode = _pclose(pipe);
+#else
+    int exitCode = pclose(pipe);
+#endif
+    // exit 0 = both diffs clean (no changes), non-zero = at least one diff has changes
+    bool changed = (exitCode != 0);
+    LOG_INFO("[hasChanges] exitCode=" + std::to_string(exitCode) + " changed=" + (changed ? "true" : "false"));
+    return changed;
+}
+
 bool SnapshotManager::isInitialized() const
 {
     // With lazy init, "initialized" means the manager is ready to use
@@ -251,40 +321,79 @@ bool SnapshotManager::gitExecBool(const std::string &args, bool inWorktree) cons
            result.find("error:") == std::string::npos;
 }
 
-std::string SnapshotManager::track()
+std::string SnapshotManager::track(bool forceInitialize)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    LOG_INFO("[track] enter, worktree=" + m_worktree + " initialized=" + (m_initialized ? "true" : "false"));
 
-    // Lazy init: create the bare repo on first track() call
+    // Lazy init: only create the bare repo when the worktree has changes.
+    // Clean repos are skipped entirely — no bare repo is created on disk.
+    bool firstInit = false;
     if (!m_initialized) {
-        if (!isGitAvailable()) return "";
+        if (!isGitAvailable()) {
+            LOG_INFO("[track] git not available, returning empty");
+            return "";
+        }
+        if (!forceInitialize) {
+            LOG_INFO("[track] checking hasChanges()...");
+            if (!hasChanges()) {
+                LOG_INFO("[track] no changes, skipping init for: " + m_worktree);
+                return "";
+            }
+        }
+        LOG_INFO(forceInitialize
+            ? "[track] forcing baseline init, calling initRepoLocked()..."
+            : "[track] hasChanges()=true, calling initRepoLocked()...");
         m_initialized = initRepoLocked();
-        if (!m_initialized) return "";
-        LOG_INFO("Snapshot repo lazy-initialized at: " + m_repoPath);
+        if (!m_initialized) {
+            LOG_ERROR("[track] initRepoLocked() failed");
+            return "";
+        }
+        LOG_INFO("Snapshot repo lazy-initialized at: " + m_repoPath + " for worktree: " + m_worktree);
+        firstInit = true;
+    }
+
+    // First time after init: the bare repo is empty (no tree objects), so
+    // git status would report EVERY file as "new".  Use git add -A instead
+    // to establish the baseline tree.  Exclude patterns skip node_modules etc.
+    if (firstInit) {
+        LOG_INFO("[track] first init: establishing baseline with git add -A...");
+        gitExec("add -A", true);
+        std::string treeHash = gitExec("write-tree", true);
+        if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
+            LOG_ERROR("[track] baseline write-tree failed: " + treeHash);
+            return "";
+        }
+        LOG_INFO("[track] baseline established, tree=" + treeHash);
+        return treeHash;
     }
 
     // Use git status --porcelain to find changed files, then only git add
     // those files instead of scanning the entire worktree with git add -A.
     // This is much faster for large projects with node_modules etc.
+    LOG_INFO("[track] running git status --porcelain...");
     std::string status = gitExec("status --porcelain", true);
+    LOG_INFO("[track] git status done, output len=" + std::to_string(status.size()));
 
     if (status.empty()) {
         // No changes — just write the current tree
+        LOG_INFO("[track] no changes, running write-tree...");
         std::string treeHash = gitExec("write-tree", true);
         if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
             LOG_ERROR("Failed to write tree: " + treeHash);
             return "";
         }
+        LOG_INFO("[track] write-tree done, hash=" + treeHash);
         LOG_DEBUG("Snapshot tracked (no changes): tree=" + treeHash);
         return treeHash;
     }
 
-    // Parse status output and build git add command
+    // Parse status output and collect changed file paths
     // Format: "XY filename" or "XY \"filename with spaces\""
     std::istringstream stream(status);
     std::string line;
-    std::string filesToAdd;
-    int fileCount = 0;
+    std::vector<std::string> files;
+    bool hasQuotedPaths = false;
     while (std::getline(stream, line)) {
         if (line.size() < 4) continue;
         std::string filePath = line.substr(3);
@@ -292,24 +401,62 @@ std::string SnapshotManager::track()
         while (!filePath.empty() && (filePath.back() == ' ' || filePath.back() == '\r'))
             filePath.pop_back();
         if (filePath.empty()) continue;
-        // Quote the file path for shell safety
-        if (!filesToAdd.empty()) filesToAdd += " ";
-        filesToAdd += "\"" + filePath + "\"";
-        fileCount++;
+        // status --porcelain wraps non-ASCII (e.g. Chinese) paths in double
+        // quotes with octal escapes (core.quotepath). Those escaped strings
+        // cannot match anything when passed back as pathspecs, and one
+        // unmatched pathspec aborts the whole "git add" atomically — a
+        // single Chinese-named file would freeze every later track(). Detect
+        // them and fall back to "add -A" below; info/exclude keeps it cheap.
+        if (filePath.front() == '"') hasQuotedPaths = true;
+        files.push_back(filePath);
     }
 
-    if (fileCount > 0) {
-        gitExec("add " + filesToAdd, true);
+    // Batch git add by command length, not only file count. Long Windows
+    // paths can exceed cmd.exe's limit even when a batch has fewer than 200 files.
+    if (hasQuotedPaths) {
+        LOG_INFO("[track] status has quoted (non-ASCII) paths, using git add -A...");
+        std::string addResult = gitExec("add -A", true);
+        if (addResult.find("fatal:") != std::string::npos || addResult.find("error:") != std::string::npos) {
+            LOG_ERROR("[track] git add -A failed: " + addResult);
+        }
+    } else if (!files.empty()) {
+        LOG_INFO("[track] git add " + std::to_string(files.size()) + " files in batches...");
+        const size_t maxBatchLength = 8000;
+        std::string batch;
+        std::string addResult;
+        for (const auto &file : files) {
+            std::string argument = "\"" + file + "\"";
+            if (!batch.empty() && batch.size() + argument.size() + 1 > maxBatchLength) {
+                addResult += gitExec("add " + batch, true);
+                batch.clear();
+            }
+            if (!batch.empty()) batch += " ";
+            batch += argument;
+        }
+        if (!batch.empty()) addResult += gitExec("add " + batch, true);
+
+        // Targeted add failed for some other reason (e.g. a path with glob
+        // characters). Retry with the full scan so staging isn't lost.
+        if (addResult.find("fatal:") != std::string::npos || addResult.find("error:") != std::string::npos) {
+            LOG_ERROR("[track] targeted git add failed, falling back to add -A: " + addResult);
+            std::string fallback = gitExec("add -A", true);
+            if (fallback.find("fatal:") != std::string::npos || fallback.find("error:") != std::string::npos) {
+                LOG_ERROR("[track] fallback git add -A failed: " + fallback);
+            }
+        }
+        LOG_INFO("[track] git add done (" + std::to_string(files.size()) + " files)");
     }
 
     // Write tree object
+    LOG_INFO("[track] running write-tree...");
     std::string treeHash = gitExec("write-tree", true);
     if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
         LOG_ERROR("Failed to write tree: " + treeHash);
         return "";
     }
+    LOG_INFO("[track] write-tree done, hash=" + treeHash);
 
-    LOG_DEBUG("Snapshot tracked: tree=" + treeHash + " (" + std::to_string(fileCount) + " files)");
+    LOG_DEBUG("Snapshot tracked: tree=" + treeHash + " (" + std::to_string(files.size()) + " files)");
     return treeHash;
 }
 
@@ -334,8 +481,10 @@ json SnapshotManager::diffFull(const std::string &fromHash, const std::string &t
     // Status per file (v1: git diff --name-status; "A"/"D"/"M")
     std::unordered_map<std::string, std::string> statusMap;
     {
+        // core.quotepath=false keeps non-ASCII paths as raw UTF-8 instead of
+        // quoted octal escapes so the IDE receives real file names.
         std::string nameStatus = gitExec(
-            "diff --no-ext-diff --no-renames --name-status " + fromHash + " " + toHash + " -- .", true);
+            "-c core.quotepath=false diff --no-ext-diff --no-renames --name-status " + fromHash + " " + toHash + " -- .", true);
         std::istringstream stream(nameStatus);
         std::string line;
         while (std::getline(stream, line)) {
@@ -350,7 +499,7 @@ json SnapshotManager::diffFull(const std::string &fromHash, const std::string &t
 
     // Additions/deletions per file (v1: git diff --numstat; "-\t-" means binary)
     std::string numstat = gitExec(
-        "diff --no-ext-diff --no-renames --numstat " + fromHash + " " + toHash + " -- .", true);
+        "-c core.quotepath=false diff --no-ext-diff --no-renames --numstat " + fromHash + " " + toHash + " -- .", true);
     std::istringstream stream(numstat);
     std::string line;
     while (std::getline(stream, line)) {
@@ -372,8 +521,15 @@ json SnapshotManager::diffFull(const std::string &fromHash, const std::string &t
         d["status"] = st != statusMap.end() ? st->second : "modified";
         // v1 renders whole-file context diffs (jsdiff with unlimited
         // context); mirror that with a huge -U value. Binary files get "".
-        d["patch"] = binary ? "" : gitExec(
-            "diff --no-ext-diff --no-renames -U1000000 " + fromHash + " " + toHash + " -- \"" + file + "\"", true);
+        std::string patchText = binary ? "" : gitExec(
+            "-c core.quotepath=false diff --no-ext-diff --no-renames -U1000000 " + fromHash + " " + toHash + " -- \"" + file + "\"", true);
+        // Pathspecs may not round-trip through cmd.exe for non-ASCII names;
+        // drop the patch rather than showing a git error in the IDE.
+        if (patchText.find("fatal:") != std::string::npos || patchText.find("error:") != std::string::npos) {
+            LOG_ERROR("[diffFull] per-file diff failed for: " + file + " - " + patchText);
+            patchText.clear();
+        }
+        d["patch"] = patchText;
         result.push_back(d);
     }
 
@@ -384,8 +540,9 @@ std::vector<PatchEntry> SnapshotManager::diffTrees(const std::string &fromHash, 
 {
     std::vector<PatchEntry> entries;
 
-    // Use git diff-tree to compare two trees
-    std::string diff = gitExec("diff-tree -r --no-commit-id --name-status " + fromHash + " " + toHash, true);
+    // Use git diff-tree to compare two trees. core.quotepath=false keeps
+    // non-ASCII paths as raw UTF-8 instead of quoted octal escapes.
+    std::string diff = gitExec("-c core.quotepath=false diff-tree -r --no-commit-id --name-status " + fromHash + " " + toHash, true);
 
     if (diff.empty()) return entries;
 
