@@ -627,13 +627,23 @@ ToolResult SessionPrompt::executeToolCall(const std::string &sessionId, const st
 
     // Skip permission check for read-only tools
     static const std::vector<std::string> readOnlyTools = {
-        "glob", "read", "list", "search", "grep", "fetch"
+        "glob", "read", "list", "search", "grep", "fetch",
+        // skill only loads the skill's instruction content; any side-effect
+        // tool it directs the model to run goes through its own check below.
+        "skill"
     };
     bool isReadOnly = std::find(readOnlyTools.begin(), readOnlyTools.end(), tc.name)
                       != readOnlyTools.end();
 
+    // Orchestration tools never touch anything themselves. The task tool
+    // runs its child session with this same permission manager, so the
+    // boundary is enforced on the tools the child actually invokes — asking
+    // for the task call itself would only double-gate (matches opencode,
+    // where the Task agent tool is permission-free).
+    bool isOrchestrationTool = tc.name == "task";
+
     // Permission check before tool execution
-    if (m_permission && !isReadOnly) {
+    if (m_permission && !isReadOnly && !isOrchestrationTool) {
         // Build patterns from tool arguments
         std::vector<std::string> patterns;
         std::string targetPath;
@@ -1316,12 +1326,17 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
                 // Parse final arguments (may have accumulated via Delta or arrive whole)
                 json input;
                 auto accumIt = toolCallAccum.find(event.toolCall.id);
-                if (accumIt != toolCallAccum.end()) {
+                if (accumIt != toolCallAccum.end() && !accumIt->second.empty()) {
                     // Had deltas — parse accumulated text
                     input = parseToolArguments(accumIt->second);
                     toolCallAccum.erase(accumIt);
                 } else {
-                    // No deltas (single-shot from provider) — use arguments directly
+                    // No deltas arrived: the parsers emit Start→End with the
+                    // arguments fully parsed on End. ToolCallStart creates an
+                    // empty accumulator, and using it here would parse("") into
+                    // {} — wiping the part's input while the executed call runs
+                    // with the real arguments from event.toolCall.arguments.
+                    if (accumIt != toolCallAccum.end()) toolCallAccum.erase(accumIt);
                     input = event.toolCall.arguments.is_string()
                         ? parseToolArguments(event.toolCall.arguments.get<std::string>())
                         : event.toolCall.arguments;

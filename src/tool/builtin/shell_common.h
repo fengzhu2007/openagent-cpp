@@ -14,6 +14,16 @@ std::string oemToUtf8(const std::string &input);
 inline std::string oemToUtf8(const std::string &input) { return input; }
 #endif
 
+// Encode a UTF-8 script for `powershell -EncodedCommand` (Base64 of UTF-16LE).
+// -Command "..." is unusable for arbitrary commands: double quotes inside the
+// command collide with the wrapping quotes and get stripped during Windows
+// command-line parsing, silently changing what the script runs.
+#ifdef _WIN32
+std::string encodePowerShellCommand(const std::string &utf8Script);
+#else
+inline std::string encodePowerShellCommand(const std::string &s) { return s; }
+#endif
+
 // Strip ANSI/VT escape sequences (CSI, OSC, charset selection, etc.)
 std::string stripAnsiCodes(const std::string &s);
 

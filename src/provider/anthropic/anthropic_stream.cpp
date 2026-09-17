@@ -150,6 +150,9 @@ void AnthropicStreamParser::handleContentBlockStop(const json &event)
         // finish() cannot flush it a second time
         PendingTool tool = std::move(m_pendingTools.back());
         m_pendingTools.pop_back();
+        // TEMP DEBUG: complete raw tool call, inputJson still the raw
+        // concatenated partial_json string (pre-parse).
+        debugLogRawToolCall(tool.id, tool.name, tool.inputJson);
         LLMEvent tcEnd;
         tcEnd.type = LLMEvent::ToolCallEnd;
         tcEnd.toolCall = {tool.id, tool.name, parseToolArguments(tool.inputJson)};
@@ -201,6 +204,9 @@ void AnthropicStreamParser::finish()
     // Flush any remaining pending tool calls — normally already flushed by
     // content_block_stop, only reached on malformed streams
     for (auto &tool : m_pendingTools) {
+        // TEMP DEBUG: raw tool call from a malformed stream, logged before
+        // the empty-id filter.
+        debugLogRawToolCall(tool.id, tool.name, tool.inputJson);
         if (!tool.id.empty()) {
             LLMEvent tcEnd;
             tcEnd.type = LLMEvent::ToolCallEnd;

@@ -36,10 +36,10 @@ json GrepTool::parameters() const
     };
 }
 
-bool GrepTool::isBinaryFile(const std::string &path)
+bool GrepTool::isBinaryFile(const fs::path &path)
 {
     // Check file extension first
-    std::string ext = fs::path(path).extension().string();
+    std::string ext = fsPathToUtf8(path.extension());
     std::transform(ext.begin(), ext.end(), ext.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
@@ -59,7 +59,9 @@ bool GrepTool::isBinaryFile(const std::string &path)
         if (ext == be) return true;
     }
 
-    // Quick content check: read first 512 bytes and look for null bytes
+    // Quick content check: read first 512 bytes and look for null bytes.
+    // The fs::path overload opens through wide APIs on Windows, so
+    // non-ASCII paths work.
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) return true;
 
@@ -147,8 +149,12 @@ ToolResult GrepTool::execute(const json &args, const std::string &cwd)
     const int maxMatches = 500;
 
     try {
+        // Base path via wide chars: the narrow fs::path constructor
+        // interprets bytes as ANSI (GBK on zh-CN Windows) and would corrupt
+        // non-ASCII paths.
+        fs::path baseDir = fs::path(utf8ToWide(basePath));
         for (auto it = fs::recursive_directory_iterator(
-                 basePath, fs::directory_options::skip_permission_denied);
+                 baseDir, fs::directory_options::skip_permission_denied);
              it != fs::recursive_directory_iterator(); ++it) {
 
             if (it.depth() > 20) {
@@ -157,7 +163,7 @@ ToolResult GrepTool::execute(const json &args, const std::string &cwd)
             }
 
             if (it->is_directory()) {
-                std::string dirName = it->path().filename().string();
+                std::string dirName = fsPathToUtf8(it->path().filename());
                 if (shouldSkipDir(dirName)) {
                     it.disable_recursion_pending();
                 }
@@ -167,15 +173,15 @@ ToolResult GrepTool::execute(const json &args, const std::string &cwd)
             if (!it->is_regular_file()) continue;
 
             // Check include filter
-            std::string filename = it->path().filename().string();
+            std::string filename = fsPathToUtf8(it->path().filename());
             if (!matchesInclude(include, filename)) continue;
 
             // Skip binary files
-            std::string filePath = it->path().string();
-            if (isBinaryFile(filePath)) continue;
+            if (isBinaryFile(it->path())) continue;
 
-            // Search file contents
-            std::ifstream file(filePath);
+            // Search file contents. The fs::path overload opens through wide
+            // APIs on Windows, so non-ASCII paths work.
+            std::ifstream file(it->path());
             if (!file.is_open()) continue;
 
             std::string line;
@@ -184,7 +190,7 @@ ToolResult GrepTool::execute(const json &args, const std::string &cwd)
                 ++lineNum;
                 if (std::regex_search(line, regex)) {
                     Match m;
-                    m.filePath = fs::relative(it->path(), basePath).string();
+                    m.filePath = fsPathToUtf8(fs::relative(it->path(), baseDir));
                     std::replace(m.filePath.begin(), m.filePath.end(), '\\', '/');
                     m.lineNumber = lineNum;
                     // Truncate long lines
@@ -199,7 +205,9 @@ ToolResult GrepTool::execute(const json &args, const std::string &cwd)
             if (static_cast<int>(matches.size()) >= maxMatches) break;
         }
     } catch (const std::exception &e) {
-        return {false, "", std::string("Grep error: ") + e.what(), "grep: " + pattern};
+        // System messages arrive in the ANSI code page on Windows; convert
+        // before embedding in UTF-8 output.
+        return {false, "", std::string("Grep error: ") + acpToUtf8(e.what()), "grep: " + pattern};
     }
 
     // Build output

@@ -3,6 +3,7 @@
 #include "util/logger.h"
 #include <chrono>
 #include <thread>
+#include <utility>
 
 // Thread-local session ID: set by executeToolCall() before each tool
 // so TaskTool can discover its parent session at execution time.
@@ -19,9 +20,12 @@ std::string getCurrentToolSessionId()
 }
 
 TaskTool::TaskTool(SessionManager &sessionMgr, ProviderRegistry &providers,
-                   ToolRegistry &tools, EventBus &events, Config &config)
+                   ToolRegistry &tools, EventBus &events, Config &config,
+                   PermissionManager *permission,
+                   std::function<std::vector<std::string>()> workingDirsGetter)
     : m_sessionMgr(sessionMgr), m_providers(providers), m_tools(tools),
-      m_events(events), m_config(config)
+      m_events(events), m_config(config),
+      m_permission(permission), m_workingDirsGetter(std::move(workingDirsGetter))
 {
 }
 
@@ -104,9 +108,13 @@ ToolResult TaskTool::execute(const json &args, const std::string &)
         subtaskPart["model"] = {{"providerID", providerId}, {"modelID", model}};
     }
 
-    // Run prompt synchronously in the child session
-    // We create a temporary SessionPrompt for the child
-    SessionPrompt childPrompt(m_sessionMgr, m_providers, m_tools, m_events, m_config);
+    // Run prompt synchronously in the child session. The child inherits the
+    // parent's permission manager and working-dirs view so permission checks
+    // fire on the tools it actually invokes (shell/write/...), while the
+    // task call itself is skipped as an orchestration tool.
+    SessionPrompt childPrompt(m_sessionMgr, m_providers, m_tools, m_events, m_config, m_permission);
+    if (m_workingDirsGetter)
+        childPrompt.setWorkingDirsGetter(m_workingDirsGetter);
 
     auto startTime = std::chrono::steady_clock::now();
     const int timeoutMinutes = 5;

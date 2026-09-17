@@ -170,8 +170,11 @@ Server::Server(const std::string &host, uint16_t port,
     m_skills->loadFromConfig(m_config.data());
     // Register SkillTool
     m_tools.registerTool(std::make_unique<SkillTool>(*m_skills));
-    // Register TaskTool (sub-task in child session; reads parent ID from thread-local)
-    m_tools.registerTool(std::make_unique<TaskTool>(m_sessionMgr, m_providers, m_tools, m_events, m_config));
+    // Register TaskTool (sub-task in child session; reads parent ID from thread-local).
+    // It inherits the permission manager and working-dirs getter so the
+    // child session's actual tool calls go through the same permission boundary.
+    m_tools.registerTool(std::make_unique<TaskTool>(m_sessionMgr, m_providers, m_tools, m_events, m_config,
+                                                    m_permission.get(), [this]() { return workingDirs(); }));
     // Workspace, Sync, Project managers (D2-D4)
     m_workspaces = std::make_unique<WorkspaceManager>(m_db);
     m_sync = std::make_unique<SyncManager>(m_db, m_events);
