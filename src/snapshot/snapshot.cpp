@@ -157,10 +157,18 @@ void SnapshotManager::cleanup()
 
 bool SnapshotManager::hasTree(const std::string &treeHash) const
 {
-    if (!m_initialized || treeHash.empty()) return false;
-    // ls-tree works in bare repos without core.worktree
-    std::string result = gitExec("ls-tree " + treeHash, false);
-    return !result.empty() && result.find("fatal:") == std::string::npos;
+    if (!m_initialized || treeHash.empty()) {
+        LOG_INFO("[hasTree] early return: initialized=" + std::to_string(m_initialized) +
+                 " hash=" + treeHash + " repo=" + m_repoPath);
+        return false;
+    }
+    // Use inWorktree=true so GIT_DIR points to our shadow repo.
+    // Without it, git ls-tree runs in the server's cwd which is not a repo.
+    std::string result = gitExec("ls-tree " + treeHash, true);
+    bool found = !result.empty() && result.find("fatal:") == std::string::npos;
+    LOG_INFO("[hasTree] hash=" + treeHash + " repo=" + m_repoPath +
+             " found=" + std::to_string(found) + " output=[" + result.substr(0, 120) + "]");
+    return found;
 }
 
 std::string SnapshotManager::hashPath(const std::string &path)
@@ -353,19 +361,15 @@ std::string SnapshotManager::track(bool forceInitialize)
         firstInit = true;
     }
 
-    // First time after init: the bare repo is empty (no tree objects), so
-    // git status would report EVERY file as "new".  Use git add -A instead
-    // to establish the baseline tree.  Exclude patterns skip node_modules etc.
-    if (firstInit) {
-        LOG_INFO("[track] first init: establishing baseline with git add -A...");
-        gitExec("add -A", true);
-        std::string treeHash = gitExec("write-tree", true);
-        if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
-            LOG_ERROR("[track] baseline write-tree failed: " + treeHash);
-            return "";
-        }
-        LOG_INFO("[track] baseline established, tree=" + treeHash);
-        return treeHash;
+    // HEAD must exist for `git status --porcelain` to report only real
+    // worktree changes: with an unborn HEAD git reports EVERY staged file as
+    // "A " (new), which made track() re-stage the entire tree on every call.
+    // Establish the baseline commit on first init; this also self-heals
+    // repos created before baseline commits existed.
+    if (!hasValidHeadLocked()) {
+        LOG_INFO(firstInit ? "[track] first init: establishing baseline..."
+                           : "[track] repo has no HEAD commit, establishing baseline...");
+        return ensureBaselineCommitLocked();
     }
 
     // Use git status --porcelain to find changed files, then only git add
@@ -456,7 +460,61 @@ std::string SnapshotManager::track(bool forceInitialize)
     }
     LOG_INFO("[track] write-tree done, hash=" + treeHash);
 
+    // Advance HEAD to the just-written tree. Without this, files staged by
+    // the add above (but never committed) would keep reappearing as "M " in
+    // every later status, re-staging them on each track() call.
+    commitTreeLocked(treeHash);
+
     LOG_DEBUG("Snapshot tracked: tree=" + treeHash + " (" + std::to_string(files.size()) + " files)");
+    return treeHash;
+}
+
+// True when the snapshot repo has at least one commit on HEAD.
+bool SnapshotManager::hasValidHeadLocked() const
+{
+    std::string head = gitExec("rev-parse --verify --quiet HEAD", true);
+    return !head.empty() && head.find("fatal") == std::string::npos;
+}
+
+// Create a commit for treeHash (parented on the current HEAD when one
+// exists) and advance HEAD to it. Identity is injected via -c so this works
+// without global git config. Returns the commit hash, or "" on failure —
+// non-fatal: a stale HEAD only means the next status reports the same
+// entries again and they get re-staged.
+std::string SnapshotManager::commitTreeLocked(const std::string &treeHash) const
+{
+    std::string parent = hasValidHeadLocked() ? gitExec("rev-parse HEAD", true) : "";
+    std::string args = "-c user.name=anycode-snapshot -c user.email=snapshot@anycode.local commit-tree "
+                     + treeHash;
+    if (!parent.empty()) args += " -p " + parent;
+    args += " -m \"snapshot\"";
+    std::string commit = gitExec(args, true);
+    if (commit.empty() || commit.find("fatal") != std::string::npos ||
+        commit.find("error") != std::string::npos) {
+        LOG_ERROR("[track] commit-tree failed: " + commit);
+        return "";
+    }
+    std::string upd = gitExec("update-ref HEAD " + commit, true);
+    if (!upd.empty() && upd.find("fatal") != std::string::npos)
+        LOG_ERROR("[track] update-ref HEAD failed: " + upd);
+    return commit;
+}
+
+// Establish the baseline: stage everything (info/exclude keeps node_modules
+// etc. out), write the tree and commit it so HEAD exists. With an unborn
+// HEAD, `git status --porcelain` reports every staged file as "A " (new)
+// and track() would re-stage the entire tree on every call.
+std::string SnapshotManager::ensureBaselineCommitLocked() const
+{
+    LOG_INFO("[track] establishing baseline with git add -A...");
+    gitExec("add -A", true);
+    std::string treeHash = gitExec("write-tree", true);
+    if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
+        LOG_ERROR("[track] baseline write-tree failed: " + treeHash);
+        return "";
+    }
+    LOG_INFO("[track] baseline established, tree=" + treeHash);
+    commitTreeLocked(treeHash);
     return treeHash;
 }
 
@@ -625,7 +683,14 @@ bool SnapshotManager::revert(const std::vector<PatchEntry> &patches)
 
 bool SnapshotManager::revertPatches(const std::vector<SnapshotPatch> &patches)
 {
-    if (!m_initialized || patches.empty()) return false;
+    LOG_INFO("[revertPatches] enter: worktree=" + m_worktree +
+             " initialized=" + (m_initialized ? "true" : "false") +
+             " patches=" + std::to_string(patches.size()));
+    if (!m_initialized || patches.empty()) {
+        LOG_INFO("[revertPatches] early return: initialized=" + std::to_string(m_initialized) +
+                 " empty=" + std::to_string(patches.empty()));
+        return false;
+    }
     std::lock_guard<std::mutex> lock(m_mutex);
 
     std::set<std::string> done;
@@ -633,6 +698,7 @@ bool SnapshotManager::revertPatches(const std::vector<SnapshotPatch> &patches)
     // Process patches in reverse order (matching opencode: undo newest first)
     for (auto it = patches.rbegin(); it != patches.rend(); ++it) {
         const std::string &treeHash = it->hash;
+        LOG_INFO("[revertPatches] processing hash=" + treeHash + " files=" + std::to_string(it->files.size()));
 
         for (const std::string &absPath : it->files) {
             // Convert absolute forward-slash path to relative path
@@ -647,26 +713,38 @@ bool SnapshotManager::revertPatches(const std::vector<SnapshotPatch> &patches)
             }
             std::replace(rel.begin(), rel.end(), '\\', '/');
 
-            if (!done.insert(rel).second) continue;
+            if (!done.insert(rel).second) {
+                LOG_INFO("[revertPatches] skip duplicate: " + rel);
+                continue;
+            }
 
-            LOG_INFO("reverting: file=" + rel + " hash=" + treeHash);
+            LOG_INFO("[revertPatches] file=" + rel + " absPath=" + absPath + " hash=" + treeHash);
 
             // Check if the file existed in this tree
             std::string lsResult = gitExec(
                 "ls-tree " + treeHash + " -- \"" + rel + "\"", true);
+            LOG_INFO("[revertPatches] ls-tree result: empty=" + std::to_string(lsResult.empty()) +
+                     " output=[" + lsResult.substr(0, 200) + "]");
 
             if (!lsResult.empty() && lsResult.find("fatal:") == std::string::npos) {
-                // File existed in the snapshot tree — restore it
-                gitExecBool("checkout " + treeHash + " -- \"" + absPath + "\"", true);
+                // File existed in the snapshot tree — restore it.
+                // Must use rel (relative path), NOT absPath: git pathspecs
+                // are resolved against cwd (the worktree), so an absolute
+                // path would be doubled (worktree + absPath) and miss.
+                bool ok = gitExecBool("checkout " + treeHash + " -- \"" + rel + "\"", true);
+                LOG_INFO("[revertPatches] checkout " + treeHash + " -- \"" + rel +
+                         "\" => " + (ok ? "OK" : "FAILED"));
             } else {
                 // File did not exist in the snapshot — delete it
                 std::string fullPath = m_worktree + PATH_SEP + rel;
                 std::replace(fullPath.begin(), fullPath.end(), '/', '\\');
-                std::remove(fullPath.c_str());
-                LOG_INFO("file did not exist in snapshot, deleting: " + rel);
+                bool removed = (std::remove(fullPath.c_str()) == 0);
+                LOG_INFO("[revertPatches] file not in snapshot, deleting: " + fullPath +
+                         " => " + (removed ? "OK" : "FAILED"));
             }
         }
     }
 
+    LOG_INFO("[revertPatches] done, files processed=" + std::to_string(done.size()));
     return true;
 }
