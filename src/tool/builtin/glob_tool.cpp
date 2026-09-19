@@ -112,10 +112,14 @@ ToolResult GlobTool::execute(const json &args, const std::string &cwd)
     const int maxResults = 2000;
 
     try {
+        // Build the base path from UTF-8 through wide chars: the narrow
+        // fs::path constructor interprets bytes as ANSI (GBK on zh-CN
+        // Windows) and would corrupt non-ASCII paths.
+        fs::path baseDir = fs::path(utf8ToWide(basePath));
         if (isRecursive || !hasPathSep) {
             // Recursive directory iteration
             for (auto it = fs::recursive_directory_iterator(
-                     basePath, fs::directory_options::skip_permission_denied);
+                     baseDir, fs::directory_options::skip_permission_denied);
                  it != fs::recursive_directory_iterator(); ++it) {
 
                 if (it.depth() > 20) {
@@ -125,7 +129,7 @@ ToolResult GlobTool::execute(const json &args, const std::string &cwd)
 
                 // Skip excluded directories
                 if (it->is_directory()) {
-                    std::string dirName = it->path().filename().string();
+                    std::string dirName = fsPathToUtf8(it->path().filename());
                     if (shouldSkipDir(dirName)) {
                         it.disable_recursion_pending();
                         continue;
@@ -134,7 +138,7 @@ ToolResult GlobTool::execute(const json &args, const std::string &cwd)
                 }
 
                 // Get relative path
-                std::string relPath = fs::relative(it->path(), basePath).string();
+                std::string relPath = fsPathToUtf8(fs::relative(it->path(), baseDir));
 
                 // Normalize separators to forward slash
                 std::replace(relPath.begin(), relPath.end(), '\\', '/');
@@ -144,10 +148,10 @@ ToolResult GlobTool::execute(const json &args, const std::string &cwd)
                 if (isRecursive) {
                     // For ** patterns, match the full relative path
                     matched = matchGlob(matchPattern, relPath) ||
-                              matchGlob(filePattern, it->path().filename().string());
+                              matchGlob(filePattern, fsPathToUtf8(it->path().filename()));
                 } else {
                     // For simple patterns, match just the filename
-                    matched = matchGlob(filePattern, it->path().filename().string());
+                    matched = matchGlob(filePattern, fsPathToUtf8(it->path().filename()));
                 }
 
                 if (matched) {
@@ -157,11 +161,11 @@ ToolResult GlobTool::execute(const json &args, const std::string &cwd)
             }
         } else {
             // Non-recursive: search only in the specified directory
-            std::string searchDir = basePath;
+            fs::path searchDir = baseDir;
             size_t lastSep = pattern.find_last_of("/\\");
             if (lastSep != std::string::npos) {
                 std::string subDir = pattern.substr(0, lastSep);
-                searchDir = (fs::path(basePath) / subDir).string();
+                searchDir /= fs::path(utf8ToWide(subDir));
             }
 
             if (fs::exists(searchDir) && fs::is_directory(searchDir)) {
@@ -169,8 +173,8 @@ ToolResult GlobTool::execute(const json &args, const std::string &cwd)
                      it != fs::directory_iterator(); ++it) {
                     if (!it->is_regular_file()) continue;
 
-                    if (matchGlob(filePattern, it->path().filename().string())) {
-                        std::string relPath = fs::relative(it->path(), basePath).string();
+                    if (matchGlob(filePattern, fsPathToUtf8(it->path().filename()))) {
+                        std::string relPath = fsPathToUtf8(fs::relative(it->path(), baseDir));
                         std::replace(relPath.begin(), relPath.end(), '\\', '/');
                         matches.push_back(relPath);
                         if (static_cast<int>(matches.size()) >= maxResults) break;
@@ -179,7 +183,9 @@ ToolResult GlobTool::execute(const json &args, const std::string &cwd)
             }
         }
     } catch (const std::exception &e) {
-        return {false, "", std::string("Glob error: ") + e.what(), "glob: " + pattern};
+        // System messages (e.g. filesystem errors) arrive in the ANSI code
+        // page on Windows; convert before embedding in UTF-8 output.
+        return {false, "", std::string("Glob error: ") + acpToUtf8(e.what()), "glob: " + pattern};
     }
 
     // Sort results

@@ -2,6 +2,8 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <chrono>
+#include <fstream>
 #include "json.hpp"
 
 using json = nlohmann::json;
@@ -28,6 +30,28 @@ inline json parseToolArguments(const std::string &arguments)
         return parsed;
     }
     catch (...) { return json::object({{"raw", arguments}}); }
+}
+
+// TEMP DEBUG: append the complete raw tool call (arguments still the raw
+// concatenated string, before parseToolArguments) to log.txt, one JSON
+// object per line. Call sites log before any filtering so malformed entries
+// (empty id/name) are visible too. Remove when done debugging.
+inline void debugLogRawToolCall(const std::string &id, const std::string &name,
+                                const std::string &rawArguments)
+{
+    try {
+        json entry = {
+            {"time", std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch()).count()},
+            {"id", id},
+            {"name", name},
+            {"arguments", rawArguments}
+        };
+        std::ofstream f("log.txt", std::ios::app);
+        if (f) f << entry.dump() << "\n";
+    } catch (...) {
+        // debug logging must never break the stream
+    }
 }
 
 // A single event from the LLM stream

@@ -11,7 +11,7 @@ public:
 
 private:
     // Check if a file is likely binary
-    static bool isBinaryFile(const std::string &path);
+    static bool isBinaryFile(const std::filesystem::path &path);
 
     // Check if a directory should be skipped
     static bool shouldSkipDir(const std::string &dirName);

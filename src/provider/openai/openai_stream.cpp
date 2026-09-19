@@ -192,6 +192,10 @@ void OpenAIStreamParser::parseDelta(const json &delta)
 void OpenAIStreamParser::flushPendingTools()
 {
     for (auto &tc : m_pendingTools) {
+        // TEMP DEBUG: complete raw tool call, arguments still the raw
+        // concatenated string (pre-parse) — logged before any filtering so
+        // malformed entries (empty id/name) are visible too.
+        debugLogRawToolCall(tc.id, tc.name, tc.arguments);
         // Skip malformed entries: without an id (or name) the call can never
         // be matched to a tool result; opencode v1 fails the whole stream in
         // this case, dropping the entry is the lenient equivalent

@@ -102,6 +102,17 @@ private:
     // Write exclude patterns to info/exclude (skips node_modules etc.)
     void writeExcludePatterns();
 
+    // True when the snapshot repo has at least one commit on HEAD
+    bool hasValidHeadLocked() const;
+
+    // Commit treeHash and advance HEAD to it (identity injected via -c, so no
+    // global git config is needed). Caller must hold m_mutex.
+    std::string commitTreeLocked(const std::string &treeHash) const;
+
+    // Stage everything, write the tree, and commit it so HEAD exists.
+    // Caller must hold m_mutex.
+    std::string ensureBaselineCommitLocked() const;
+
     // Compute a short hash of the worktree path for repo naming
     static std::string hashPath(const std::string &path);
 

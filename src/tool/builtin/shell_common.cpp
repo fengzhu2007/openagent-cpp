@@ -41,6 +41,34 @@ std::string oemToUtf8(const std::string &input)
     WideCharToMultiByte(CP_UTF8, 0, wide.data(), wlen, &out[0], ulen, nullptr, nullptr);
     return out;
 }
+
+// Base64 (RFC 4648, no line breaks) — used by encodePowerShellCommand.
+static std::string base64Encode(const unsigned char *data, size_t len)
+{
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        unsigned n = (unsigned)data[i] << 16;
+        if (i + 1 < len) n |= (unsigned)data[i + 1] << 8;
+        if (i + 2 < len) n |= (unsigned)data[i + 2];
+        out += tbl[(n >> 18) & 0x3F];
+        out += tbl[(n >> 12) & 0x3F];
+        out += (i + 1 < len) ? tbl[(n >> 6) & 0x3F] : '=';
+        out += (i + 2 < len) ? tbl[n & 0x3F] : '=';
+    }
+    return out;
+}
+
+std::string encodePowerShellCommand(const std::string &utf8Script)
+{
+    // Base64 of UTF-16LE. Also carries non-ASCII (UTF-8) commands through
+    // cleanly, where a narrow command line would hit the ANSI code page.
+    std::wstring wide = utf8ToWide(utf8Script);
+    return base64Encode(reinterpret_cast<const unsigned char *>(wide.data()),
+                        wide.size() * sizeof(wchar_t));
+}
 #endif
 
 std::string stripAnsiCodes(const std::string &s)
@@ -109,13 +137,14 @@ ToolResult executePopen(const std::string &command, int /*timeoutSec*/,
     std::string cdPrefix = cwd.empty() ? "" : "cd /d \"" + cwd + "\" && ";
 
     if (shellType == "powershell") {
-        // PowerShell: disable progress bar, then run the user command.
-        // -Command without wrapping quotes lets PowerShell consume the rest
-        // of the cmd.exe command line as its script.
+        // -EncodedCommand (Base64 UTF-16LE) instead of -Command "...": a
+        // double quote inside `command` collides with the wrapping quotes and
+        // is stripped during Windows command-line parsing, changing what the
+        // script actually runs.
         fullCmd = cdPrefix
-                + "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \""
-                + "$ProgressPreference='SilentlyContinue';" + command
-                + "\" 2>&1";
+                + "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand "
+                + encodePowerShellCommand("$ProgressPreference='SilentlyContinue';" + command)
+                + " 2>&1";
     } else {
         // cmd.exe or default — _popen already uses cmd.exe on Windows
         fullCmd = cdPrefix + command + " 2>&1";

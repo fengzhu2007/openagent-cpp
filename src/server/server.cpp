@@ -170,8 +170,11 @@ Server::Server(const std::string &host, uint16_t port,
     m_skills->loadFromConfig(m_config.data());
     // Register SkillTool
     m_tools.registerTool(std::make_unique<SkillTool>(*m_skills));
-    // Register TaskTool (sub-task in child session; reads parent ID from thread-local)
-    m_tools.registerTool(std::make_unique<TaskTool>(m_sessionMgr, m_providers, m_tools, m_events, m_config));
+    // Register TaskTool (sub-task in child session; reads parent ID from thread-local).
+    // It inherits the permission manager and working-dirs getter so the
+    // child session's actual tool calls go through the same permission boundary.
+    m_tools.registerTool(std::make_unique<TaskTool>(m_sessionMgr, m_providers, m_tools, m_events, m_config,
+                                                    m_permission.get(), [this]() { return workingDirs(); }));
     // Workspace, Sync, Project managers (D2-D4)
     m_workspaces = std::make_unique<WorkspaceManager>(m_db);
     m_sync = std::make_unique<SyncManager>(m_db, m_events);
@@ -2038,9 +2041,11 @@ void Server::handleRevert(const httplib::Request &req, httplib::Response &res)
         middleware::sendError(res, 400, "Missing 'messageID' in request body");
         return;
     }
+    LOG_INFO("[revert] session=" + sessionId + " messageID=" + messageId);
 
     // Get all messages for this session
     auto messages = m_sessionMgr.getMessages(sessionId, 10000);
+    LOG_INFO("[revert] total messages=" + std::to_string(messages.size()));
 
     // Find the target message index
     int targetIdx = -1;
@@ -2048,9 +2053,12 @@ void Server::handleRevert(const httplib::Request &req, httplib::Response &res)
         if (messages[i].id == messageId) { targetIdx = i; break; }
     }
     if (targetIdx < 0) {
+        LOG_ERROR("[revert] messageID not found: " + messageId);
         middleware::sendError(res, 404, "Message not found: " + messageId);
         return;
     }
+    LOG_INFO("[revert] targetIdx=" + std::to_string(targetIdx) + " role=" +
+             (messages[targetIdx].role == MessageRole::User ? "user" : "assistant"));
 
     // Collect file entries from patch parts of all messages AFTER the target.
     // New multi-directory patch format: {files: [{file: absPath, hash: treeHash}]}
@@ -2080,6 +2088,10 @@ void Server::handleRevert(const httplib::Request &req, httplib::Response &res)
             }
         }
     }
+    LOG_INFO("[revert] allEntries count=" + std::to_string(allEntries.size()));
+    for (const auto &e : allEntries) {
+        LOG_INFO("[revert]   entry: file=" + e.file + " hash=" + e.hash);
+    }
 
     // Group entries by owning SnapshotManager (probed via hasTree)
     std::map<SnapshotManager*, std::vector<SnapshotPatch>> grouped;
@@ -2094,6 +2106,10 @@ void Server::handleRevert(const httplib::Request &req, httplib::Response &res)
                 if (s->hasTree(e.hash)) { owner = s.get(); break; }
             }
             hashOwner[e.hash] = owner;
+            if (!owner) {
+                LOG_INFO("[revert] hasTree NOT FOUND for hash=" + e.hash +
+                         " file=" + e.file + " (checked " + std::to_string(m_snapshots.size()) + " snapshots)");
+            }
         }
         if (!owner) continue;
         auto &patches = grouped[owner];
@@ -2102,14 +2118,26 @@ void Server::handleRevert(const httplib::Request &req, httplib::Response &res)
         }
         patches.back().files.push_back(e.file);
     }
+    LOG_INFO("[revert] grouped managers=" + std::to_string(grouped.size()));
+    for (const auto &[mgr, gp] : grouped) {
+        LOG_INFO("[revert]   manager worktree=" + mgr->worktree() +
+                 " patches=" + std::to_string(gp.size()));
+        for (const auto &p : gp) {
+            LOG_INFO("[revert]     hash=" + p.hash + " files=" + std::to_string(p.files.size()));
+            for (const auto &f : p.files)
+                LOG_INFO("[revert]       file=" + f);
+        }
+    }
 
-    // Save current state of all snapshots for potential unrevert (multi-hash)
+    // Save current state of ONLY the affected snapshot managers (those in
+    // grouped). Iterating all m_snapshots would trigger unnecessary git
+    // operations (hasChanges, init, write-tree) on unrelated directories.
     json originalSnapshots = json::object();
-    for (auto &s : m_snapshots) {
-        if (!s || !s->isInitialized()) continue;
-        std::string h = s->track();
+    for (auto &[mgr, patches] : grouped) {
+        std::string h = mgr->track();
+        LOG_INFO("[revert] track() before revert: worktree=" + mgr->worktree() + " hash=" + h);
         if (!h.empty()) {
-            std::string wt = s->worktree();
+            std::string wt = mgr->worktree();
             std::replace(wt.begin(), wt.end(), '\\', '/');
             originalSnapshots[wt] = h;
         }
@@ -2117,20 +2145,22 @@ void Server::handleRevert(const httplib::Request &req, httplib::Response &res)
 
     // Revert patches via their owning managers
     for (auto &[mgr, patches] : grouped) {
-        mgr->revertPatches(patches);
+        LOG_INFO("[revert] calling revertPatches: worktree=" + mgr->worktree() +
+                 " patchGroups=" + std::to_string(patches.size()));
+        bool ok = mgr->revertPatches(patches);
+        LOG_INFO("[revert] revertPatches returned: " + std::string(ok ? "true" : "false"));
     }
 
-    // Compute diff for each directory after revert
+    // Compute diff for each affected directory after revert
     json diffs = json::array();
-    for (auto &s : m_snapshots) {
-        if (!s || !s->isInitialized()) continue;
-        std::string wt = s->worktree();
+    for (auto &[mgr, patches] : grouped) {
+        std::string wt = mgr->worktree();
         std::replace(wt.begin(), wt.end(), '\\', '/');
         if (!originalSnapshots.contains(wt)) continue;
         std::string beforeHash = originalSnapshots[wt].get<std::string>();
-        std::string afterHash = s->track();
+        std::string afterHash = mgr->track();
         if (beforeHash.empty() || afterHash.empty()) continue;
-        auto dirDiffs = s->diffFull(beforeHash, afterHash);
+        auto dirDiffs = mgr->diffFull(beforeHash, afterHash);
         for (auto &d : dirDiffs) diffs.push_back(d);
     }
 
@@ -2163,6 +2193,12 @@ void Server::handleRevert(const httplib::Request &req, httplib::Response &res)
         {"sessionID", sessionId},
         {"revert", revertInfo}
     });
+
+    LOG_INFO("[revert] COMPLETE session=" + sessionId +
+             " files=" + std::to_string(allEntries.size()) +
+             " grouped=" + std::to_string(grouped.size()) +
+             " diffFiles=" + std::to_string(diffs.size()) +
+             " +" + std::to_string(additions) + " -" + std::to_string(deletions));
 
     middleware::sendJSON(res, json::object({
         {"ok", true},
@@ -4083,22 +4119,6 @@ void Server::handleRevertStage(const httplib::Request &req, httplib::Response &r
         return;
     }
 
-    // Capture current state of all snapshots as the "original" (for undo)
-    json originalSnapshots = json::object();
-    for (auto &s : m_snapshots) {
-        if (!s || !s->isInitialized()) continue;
-        std::string h = s->track();
-        if (!h.empty()) {
-            std::string wt = s->worktree();
-            std::replace(wt.begin(), wt.end(), '\\', '/');
-            originalSnapshots[wt] = h;
-        }
-    }
-    if (originalSnapshots.empty()) {
-        middleware::sendError(res, 500, "Failed to capture current snapshot");
-        return;
-    }
-
     // Collect patches from messages after the target (same logic as handleRevert)
     auto messages = m_sessionMgr.getMessages(sessionId, 10000);
     int targetIdx = -1;
@@ -4159,6 +4179,17 @@ void Server::handleRevertStage(const httplib::Request &req, httplib::Response &r
         patches.back().files.push_back(e.file);
     }
 
+    // Save current state of ONLY the affected snapshot managers (for undo)
+    json originalSnapshots = json::object();
+    for (auto &[mgr, patches] : grouped) {
+        std::string h = mgr->track();
+        if (!h.empty()) {
+            std::string wt = mgr->worktree();
+            std::replace(wt.begin(), wt.end(), '\\', '/');
+            originalSnapshots[wt] = h;
+        }
+    }
+
     // Apply the revert (restore files to pre-change state)
     for (auto &[mgr, patches] : grouped) {
         mgr->revertPatches(patches);
@@ -4166,15 +4197,14 @@ void Server::handleRevertStage(const httplib::Request &req, httplib::Response &r
 
     // Compute diff: what changed between original and current (after revert)
     json diffs = json::array();
-    for (auto &s : m_snapshots) {
-        if (!s || !s->isInitialized()) continue;
-        std::string wt = s->worktree();
+    for (auto &[mgr, patches] : grouped) {
+        std::string wt = mgr->worktree();
         std::replace(wt.begin(), wt.end(), '\\', '/');
         if (!originalSnapshots.contains(wt)) continue;
         std::string beforeHash = originalSnapshots[wt].get<std::string>();
-        std::string afterHash = s->track();
+        std::string afterHash = mgr->track();
         if (beforeHash.empty() || afterHash.empty()) continue;
-        auto dirDiffs = s->diffFull(beforeHash, afterHash);
+        auto dirDiffs = mgr->diffFull(beforeHash, afterHash);
         for (auto &d : dirDiffs) diffs.push_back(d);
     }
 

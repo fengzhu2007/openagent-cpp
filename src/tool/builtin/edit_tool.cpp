@@ -167,14 +167,39 @@ ToolResult EditTool::execute(const json &args, const std::string &cwd)
         contentWithoutBom = content.substr(3);
     }
 
-    // Find all occurrences of oldText
+    // Detect original line ending style before normalization
+    bool fileIsCRLF = contentWithoutBom.find("\r\n") != std::string::npos;
+
+    // Normalize \r\n to \n for matching.
+    // AI models send oldText/newText with \n line endings (JSON standard),
+    // but Windows files typically use \r\n. Without normalization the
+    // string search would never match on CRLF files.
+    auto normalizeNewlines = [](const std::string &s) -> std::string {
+        std::string result;
+        result.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '\r' && i + 1 < s.size() && s[i + 1] == '\n') {
+                result += '\n';
+                ++i;
+            } else {
+                result += s[i];
+            }
+        }
+        return result;
+    };
+
+    std::string normalizedContent = normalizeNewlines(contentWithoutBom);
+    std::string normalizedOld = normalizeNewlines(oldText);
+    std::string normalizedNew = normalizeNewlines(newText);
+
+    // Find all occurrences of oldText in normalized content
     size_t count = 0;
     size_t pos = 0;
     size_t foundPos = std::string::npos;
-    while ((pos = contentWithoutBom.find(oldText, pos)) != std::string::npos) {
+    while ((pos = normalizedContent.find(normalizedOld, pos)) != std::string::npos) {
         foundPos = (foundPos == std::string::npos) ? pos : foundPos;
         ++count;
-        pos += oldText.size();
+        pos += normalizedOld.size();
     }
 
     if (count == 0) {
@@ -187,13 +212,28 @@ ToolResult EditTool::execute(const json &args, const std::string &cwd)
                  "edit: " + path};
     }
 
-    // Perform the replacement
-    std::string oldContent = contentWithoutBom;
-    std::string newContent = contentWithoutBom;
-    newContent.replace(foundPos, oldText.size(), newText);
+    // Perform the replacement on normalized content
+    std::string oldContent = normalizedContent;
+    std::string newContent = normalizedContent;
+    newContent.replace(foundPos, normalizedOld.size(), normalizedNew);
+
+    // Restore original line ending style if the file used CRLF
+    std::string finalContent;
+    if (fileIsCRLF) {
+        finalContent.reserve(newContent.size() + newContent.size() / 40);
+        for (char c : newContent) {
+            if (c == '\n') {
+                finalContent += "\r\n";
+            } else {
+                finalContent += c;
+            }
+        }
+    } else {
+        finalContent = newContent;
+    }
 
     // Write back with BOM if present
-    std::string finalContent = bom + newContent;
+    finalContent = bom + finalContent;
 #ifdef _WIN32
     FILE *outFp = _wfopen(utf8ToWide(path).c_str(), L"wb");
     if (!outFp) {

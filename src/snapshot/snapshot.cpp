@@ -70,8 +70,9 @@ bool SnapshotManager::isGitRepo(const std::string &dir)
     FILE *pipe = popen(cmd.c_str(), "r");
 #endif
     if (!pipe) return false;
-    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
-        result += buffer.data();
+    size_t n;
+    while ((n = fread(buffer.data(), 1, buffer.size(), pipe)) > 0) {
+        result.append(buffer.data(), n);
     }
 #ifdef _WIN32
     int exitCode = _pclose(pipe);
@@ -108,8 +109,9 @@ bool SnapshotManager::hasChanges() const
         return false;
     }
     // Drain output (git diff --quiet produces no output, but just in case)
-    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
-        result += buffer.data();
+    size_t n;
+    while ((n = fread(buffer.data(), 1, buffer.size(), pipe)) > 0) {
+        result.append(buffer.data(), n);
     }
 #ifdef _WIN32
     int exitCode = _pclose(pipe);
@@ -157,10 +159,19 @@ void SnapshotManager::cleanup()
 
 bool SnapshotManager::hasTree(const std::string &treeHash) const
 {
-    if (!m_initialized || treeHash.empty()) return false;
-    // ls-tree works in bare repos without core.worktree
-    std::string result = gitExec("ls-tree " + treeHash, false);
-    return !result.empty() && result.find("fatal:") == std::string::npos;
+    if (!m_initialized || treeHash.empty()) {
+        LOG_INFO("[hasTree] early return: initialized=" + std::to_string(m_initialized) +
+                 " hash=" + treeHash + " repo=" + m_repoPath);
+        return false;
+    }
+    // Use inWorktree=true so GIT_DIR points to our shadow repo.
+    // Without it, git ls-tree runs in the server's cwd which is not a repo.
+    std::string result = gitExec("ls-tree " + treeHash, true);
+    bool found = result.find("fatal:") == std::string::npos &&
+                 result.find("error:") == std::string::npos;
+    LOG_INFO("[hasTree] hash=" + treeHash + " repo=" + m_repoPath +
+             " found=" + std::to_string(found) + " output=[" + result.substr(0, 120) + "]");
+    return found;
 }
 
 std::string SnapshotManager::hashPath(const std::string &path)
@@ -294,8 +305,9 @@ std::string SnapshotManager::gitExec(const std::string &args, bool inWorktree) c
 
     if (!pipe) return "";
 
-    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
-        result += buffer.data();
+    size_t n;
+    while ((n = fread(buffer.data(), 1, buffer.size(), pipe)) > 0) {
+        result.append(buffer.data(), n);
     }
 
 #ifdef _WIN32
@@ -353,26 +365,22 @@ std::string SnapshotManager::track(bool forceInitialize)
         firstInit = true;
     }
 
-    // First time after init: the bare repo is empty (no tree objects), so
-    // git status would report EVERY file as "new".  Use git add -A instead
-    // to establish the baseline tree.  Exclude patterns skip node_modules etc.
-    if (firstInit) {
-        LOG_INFO("[track] first init: establishing baseline with git add -A...");
-        gitExec("add -A", true);
-        std::string treeHash = gitExec("write-tree", true);
-        if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
-            LOG_ERROR("[track] baseline write-tree failed: " + treeHash);
-            return "";
-        }
-        LOG_INFO("[track] baseline established, tree=" + treeHash);
-        return treeHash;
+    // HEAD must exist for `git status --porcelain` to report only real
+    // worktree changes: with an unborn HEAD git reports EVERY staged file as
+    // "A " (new), which made track() re-stage the entire tree on every call.
+    // Establish the baseline commit on first init; this also self-heals
+    // repos created before baseline commits existed.
+    if (!hasValidHeadLocked()) {
+        LOG_INFO(firstInit ? "[track] first init: establishing baseline..."
+                           : "[track] repo has no HEAD commit, establishing baseline...");
+        return ensureBaselineCommitLocked();
     }
 
     // Use git status --porcelain to find changed files, then only git add
     // those files instead of scanning the entire worktree with git add -A.
     // This is much faster for large projects with node_modules etc.
     LOG_INFO("[track] running git status --porcelain...");
-    std::string status = gitExec("status --porcelain", true);
+    std::string status = gitExec("-c core.quotepath=false status --porcelain -z --no-renames", true);
     LOG_INFO("[track] git status done, output len=" + std::to_string(status.size()));
 
     if (status.empty()) {
@@ -388,38 +396,29 @@ std::string SnapshotManager::track(bool forceInitialize)
         return treeHash;
     }
 
-    // Parse status output and collect changed file paths
-    // Format: "XY filename" or "XY \"filename with spaces\""
-    std::istringstream stream(status);
-    std::string line;
+    // Parse status output and collect changed file paths.
+    // -z terminates each entry with NUL (no C-style quoting) and --no-renames
+    // suppresses "R  old -> new" records, so every entry is exactly "XY <path>".
+    // core.quotepath=false keeps non-ASCII (e.g. Chinese) paths as raw UTF-8
+    // instead of octal escapes. This fixes three old parser bugs: renamed files
+    // were read as one bogus path, non-ASCII paths forced an expensive full
+    // add -A, and filenames with glob chars could be misinterpreted by git.
     std::vector<std::string> files;
-    bool hasQuotedPaths = false;
-    while (std::getline(stream, line)) {
-        if (line.size() < 4) continue;
-        std::string filePath = line.substr(3);
-        // Trim trailing whitespace
-        while (!filePath.empty() && (filePath.back() == ' ' || filePath.back() == '\r'))
-            filePath.pop_back();
+    size_t pos = 0;
+    while (pos < status.size()) {
+        size_t nul = status.find('\0', pos);
+        if (nul == std::string::npos) nul = status.size();
+        std::string entry = status.substr(pos, nul - pos);
+        pos = nul + 1;
+        if (entry.size() < 4) continue;  // "XY " plus at least one path char
+        std::string filePath = entry.substr(3);
         if (filePath.empty()) continue;
-        // status --porcelain wraps non-ASCII (e.g. Chinese) paths in double
-        // quotes with octal escapes (core.quotepath). Those escaped strings
-        // cannot match anything when passed back as pathspecs, and one
-        // unmatched pathspec aborts the whole "git add" atomically — a
-        // single Chinese-named file would freeze every later track(). Detect
-        // them and fall back to "add -A" below; info/exclude keeps it cheap.
-        if (filePath.front() == '"') hasQuotedPaths = true;
         files.push_back(filePath);
     }
 
     // Batch git add by command length, not only file count. Long Windows
     // paths can exceed cmd.exe's limit even when a batch has fewer than 200 files.
-    if (hasQuotedPaths) {
-        LOG_INFO("[track] status has quoted (non-ASCII) paths, using git add -A...");
-        std::string addResult = gitExec("add -A", true);
-        if (addResult.find("fatal:") != std::string::npos || addResult.find("error:") != std::string::npos) {
-            LOG_ERROR("[track] git add -A failed: " + addResult);
-        }
-    } else if (!files.empty()) {
+    if (!files.empty()) {
         LOG_INFO("[track] git add " + std::to_string(files.size()) + " files in batches...");
         const size_t maxBatchLength = 8000;
         std::string batch;
@@ -436,7 +435,8 @@ std::string SnapshotManager::track(bool forceInitialize)
         if (!batch.empty()) addResult += gitExec("add " + batch, true);
 
         // Targeted add failed for some other reason (e.g. a path with glob
-        // characters). Retry with the full scan so staging isn't lost.
+        // characters git still expands, or a non-ASCII name cmd.exe mangled on
+        // Windows). Retry with the full scan so staging isn't lost.
         if (addResult.find("fatal:") != std::string::npos || addResult.find("error:") != std::string::npos) {
             LOG_ERROR("[track] targeted git add failed, falling back to add -A: " + addResult);
             std::string fallback = gitExec("add -A", true);
@@ -456,7 +456,61 @@ std::string SnapshotManager::track(bool forceInitialize)
     }
     LOG_INFO("[track] write-tree done, hash=" + treeHash);
 
+    // Advance HEAD to the just-written tree. Without this, files staged by
+    // the add above (but never committed) would keep reappearing as "M " in
+    // every later status, re-staging them on each track() call.
+    commitTreeLocked(treeHash);
+
     LOG_DEBUG("Snapshot tracked: tree=" + treeHash + " (" + std::to_string(files.size()) + " files)");
+    return treeHash;
+}
+
+// True when the snapshot repo has at least one commit on HEAD.
+bool SnapshotManager::hasValidHeadLocked() const
+{
+    std::string head = gitExec("rev-parse --verify --quiet HEAD", true);
+    return !head.empty() && head.find("fatal") == std::string::npos;
+}
+
+// Create a commit for treeHash (parented on the current HEAD when one
+// exists) and advance HEAD to it. Identity is injected via -c so this works
+// without global git config. Returns the commit hash, or "" on failure —
+// non-fatal: a stale HEAD only means the next status reports the same
+// entries again and they get re-staged.
+std::string SnapshotManager::commitTreeLocked(const std::string &treeHash) const
+{
+    std::string parent = hasValidHeadLocked() ? gitExec("rev-parse HEAD", true) : "";
+    std::string args = "-c user.name=anycode-snapshot -c user.email=snapshot@anycode.local commit-tree "
+                     + treeHash;
+    if (!parent.empty()) args += " -p " + parent;
+    args += " -m \"snapshot\"";
+    std::string commit = gitExec(args, true);
+    if (commit.empty() || commit.find("fatal") != std::string::npos ||
+        commit.find("error") != std::string::npos) {
+        LOG_ERROR("[track] commit-tree failed: " + commit);
+        return "";
+    }
+    std::string upd = gitExec("update-ref HEAD " + commit, true);
+    if (!upd.empty() && upd.find("fatal") != std::string::npos)
+        LOG_ERROR("[track] update-ref HEAD failed: " + upd);
+    return commit;
+}
+
+// Establish the baseline: stage everything (info/exclude keeps node_modules
+// etc. out), write the tree and commit it so HEAD exists. With an unborn
+// HEAD, `git status --porcelain` reports every staged file as "A " (new)
+// and track() would re-stage the entire tree on every call.
+std::string SnapshotManager::ensureBaselineCommitLocked() const
+{
+    LOG_INFO("[track] establishing baseline with git add -A...");
+    gitExec("add -A", true);
+    std::string treeHash = gitExec("write-tree", true);
+    if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
+        LOG_ERROR("[track] baseline write-tree failed: " + treeHash);
+        return "";
+    }
+    LOG_INFO("[track] baseline established, tree=" + treeHash);
+    commitTreeLocked(treeHash);
     return treeHash;
 }
 
@@ -625,7 +679,14 @@ bool SnapshotManager::revert(const std::vector<PatchEntry> &patches)
 
 bool SnapshotManager::revertPatches(const std::vector<SnapshotPatch> &patches)
 {
-    if (!m_initialized || patches.empty()) return false;
+    LOG_INFO("[revertPatches] enter: worktree=" + m_worktree +
+             " initialized=" + (m_initialized ? "true" : "false") +
+             " patches=" + std::to_string(patches.size()));
+    if (!m_initialized || patches.empty()) {
+        LOG_INFO("[revertPatches] early return: initialized=" + std::to_string(m_initialized) +
+                 " empty=" + std::to_string(patches.empty()));
+        return false;
+    }
     std::lock_guard<std::mutex> lock(m_mutex);
 
     std::set<std::string> done;
@@ -633,6 +694,7 @@ bool SnapshotManager::revertPatches(const std::vector<SnapshotPatch> &patches)
     // Process patches in reverse order (matching opencode: undo newest first)
     for (auto it = patches.rbegin(); it != patches.rend(); ++it) {
         const std::string &treeHash = it->hash;
+        LOG_INFO("[revertPatches] processing hash=" + treeHash + " files=" + std::to_string(it->files.size()));
 
         for (const std::string &absPath : it->files) {
             // Convert absolute forward-slash path to relative path
@@ -647,26 +709,38 @@ bool SnapshotManager::revertPatches(const std::vector<SnapshotPatch> &patches)
             }
             std::replace(rel.begin(), rel.end(), '\\', '/');
 
-            if (!done.insert(rel).second) continue;
+            if (!done.insert(rel).second) {
+                LOG_INFO("[revertPatches] skip duplicate: " + rel);
+                continue;
+            }
 
-            LOG_INFO("reverting: file=" + rel + " hash=" + treeHash);
+            LOG_INFO("[revertPatches] file=" + rel + " absPath=" + absPath + " hash=" + treeHash);
 
             // Check if the file existed in this tree
             std::string lsResult = gitExec(
                 "ls-tree " + treeHash + " -- \"" + rel + "\"", true);
+            LOG_INFO("[revertPatches] ls-tree result: empty=" + std::to_string(lsResult.empty()) +
+                     " output=[" + lsResult.substr(0, 200) + "]");
 
             if (!lsResult.empty() && lsResult.find("fatal:") == std::string::npos) {
-                // File existed in the snapshot tree — restore it
-                gitExecBool("checkout " + treeHash + " -- \"" + absPath + "\"", true);
+                // File existed in the snapshot tree — restore it.
+                // Must use rel (relative path), NOT absPath: git pathspecs
+                // are resolved against cwd (the worktree), so an absolute
+                // path would be doubled (worktree + absPath) and miss.
+                bool ok = gitExecBool("checkout " + treeHash + " -- \"" + rel + "\"", true);
+                LOG_INFO("[revertPatches] checkout " + treeHash + " -- \"" + rel +
+                         "\" => " + (ok ? "OK" : "FAILED"));
             } else {
                 // File did not exist in the snapshot — delete it
                 std::string fullPath = m_worktree + PATH_SEP + rel;
                 std::replace(fullPath.begin(), fullPath.end(), '/', '\\');
-                std::remove(fullPath.c_str());
-                LOG_INFO("file did not exist in snapshot, deleting: " + rel);
+                bool removed = (std::remove(fullPath.c_str()) == 0);
+                LOG_INFO("[revertPatches] file not in snapshot, deleting: " + fullPath +
+                         " => " + (removed ? "OK" : "FAILED"));
             }
         }
     }
 
+    LOG_INFO("[revertPatches] done, files processed=" + std::to_string(done.size()));
     return true;
 }

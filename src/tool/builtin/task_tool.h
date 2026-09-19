@@ -5,6 +5,8 @@
 #include "tool/tool_registry.h"
 #include "event/event_bus.h"
 #include "config/config.h"
+#include "permission/permission.h"
+#include <functional>
 
 // Set/get the session ID for the tool currently executing.
 // Called by SessionPrompt::executeToolCall() before each tool->execute().
@@ -17,7 +19,9 @@ std::string getCurrentToolSessionId();
 class TaskTool : public Tool {
 public:
     TaskTool(SessionManager &sessionMgr, ProviderRegistry &providers,
-             ToolRegistry &tools, EventBus &events, Config &config);
+             ToolRegistry &tools, EventBus &events, Config &config,
+             PermissionManager *permission = nullptr,
+             std::function<std::vector<std::string>()> workingDirsGetter = nullptr);
 
     std::string name() const override { return "task"; }
     std::string description() const override;
@@ -30,4 +34,8 @@ private:
     ToolRegistry &m_tools;
     EventBus &m_events;
     Config &m_config;
+    // Inherited by the child SessionPrompt so the permission boundary lands
+    // on the tools the child actually invokes, not the task call itself.
+    PermissionManager *m_permission = nullptr;
+    std::function<std::vector<std::string>()> m_workingDirsGetter;
 };

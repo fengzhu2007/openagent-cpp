@@ -610,8 +610,8 @@ ToolResult SessionPrompt::executeToolCall(const std::string &sessionId, const st
         if (!dirs.empty()) toolCwd = dirs[0];
     }
 
-    // Resolve relative "path" arguments so the permission check below and the
-    // tool itself see the same absolute target (tools resolve idempotently).
+    // Resolve relative "path" arguments so the tool sees the same absolute
+    // target that the permission check already approved.
     json args = tc.arguments;
     // Guard: some models may return arguments as a JSON array or primitive
     // instead of an object; contains()/operator[] with a string key only
@@ -627,13 +627,26 @@ ToolResult SessionPrompt::executeToolCall(const std::string &sessionId, const st
 
     // Skip permission check for read-only tools
     static const std::vector<std::string> readOnlyTools = {
-        "glob", "read", "list", "search", "grep", "fetch"
+        "glob", "read", "list", "search", "grep", "fetch",
+        // skill only loads the skill's instruction content; any side-effect
+        // tool it directs the model to run goes through its own check below.
+        "skill"
     };
     bool isReadOnly = std::find(readOnlyTools.begin(), readOnlyTools.end(), tc.name)
                       != readOnlyTools.end();
 
-    // Permission check before tool execution
-    if (m_permission && !isReadOnly) {
+    // Orchestration tools never touch anything themselves. The task tool
+    // runs its child session with this same permission manager, so the
+    // boundary is enforced on the tools the child actually invokes — asking
+    // for the task call itself would only double-gate (matches opencode,
+    // where the Task agent tool is permission-free).
+    bool isOrchestrationTool = tc.name == "task";
+
+    // Permission check before tool execution.
+    // By this point the DB part.data.state.input is already populated with
+    // real arguments (set in ToolCallEnd), so the permission metadata and
+    // UI can show the actual tool input to the user.
+    if (m_permission && !isReadOnly && !isOrchestrationTool) {
         // Build patterns from tool arguments
         std::vector<std::string> patterns;
         std::string targetPath;
@@ -658,13 +671,13 @@ ToolResult SessionPrompt::executeToolCall(const std::string &sessionId, const st
         // Auto-allow operations within the project directory
         bool inProjectDir = false;
         LOG_DEBUG("Permission check: tool=" + tc.name + " sessionDir=" + sessionDir + " patterns=" + (patterns.empty() ? "*" : patterns[0]));
-        
+
         // Build list of directories to check against
         std::vector<std::string> checkDirs = m_workingDirsGetter ? m_workingDirsGetter() : std::vector<std::string>{};
         if (checkDirs.empty() && !sessionDir.empty()) {
             checkDirs.push_back(sessionDir);
         }
-        
+
         if (!checkDirs.empty()) {
             if (isShellTool(tc.name)) {
                 // Shell commands execute in the session's working directory,
@@ -1309,27 +1322,42 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
                 }
 
             } else if (event.type == LLMEvent::ToolCallEnd) {
-                // Finalize: push to toolCalls for execution, update part with complete args
-                toolCalls.push_back(event.toolCall);
-                hasToolCalls = true;
-
                 // Parse final arguments (may have accumulated via Delta or arrive whole)
                 json input;
                 auto accumIt = toolCallAccum.find(event.toolCall.id);
-                if (accumIt != toolCallAccum.end()) {
-                    // Had deltas — parse accumulated text
+                if (accumIt != toolCallAccum.end() && !accumIt->second.empty()) {
+                    // Had real deltas — parse accumulated text
                     input = parseToolArguments(accumIt->second);
                     toolCallAccum.erase(accumIt);
                 } else {
-                    // No deltas (single-shot from provider) — use arguments directly
+                    // No deltas (or empty accumulator from ToolCallStart) —
+                    // use the fully parsed arguments from the End event.
+                    if (accumIt != toolCallAccum.end()) toolCallAccum.erase(accumIt);
                     input = event.toolCall.arguments.is_string()
                         ? parseToolArguments(event.toolCall.arguments.get<std::string>())
                         : event.toolCall.arguments;
                 }
 
+                // Normalise arguments
+                if (!input.is_object()) {
+                    input = json::object({{"raw", input.dump()}});
+                }
+
+                // Resolve relative "path" against the session working directory
+                // so the DB record shows the same absolute path the tool will
+                // actually write to (resolvePath is idempotent).
+                std::string permToolCwd = sessionDir;
+                if ((permToolCwd.empty() || permToolCwd == ".") && m_workingDirsGetter) {
+                    auto pdirs = m_workingDirsGetter();
+                    if (!pdirs.empty()) permToolCwd = pdirs[0];
+                }
+                if (!permToolCwd.empty() && input.contains("path") && input["path"].is_string()) {
+                    input["path"] = resolvePath(permToolCwd, input["path"].get<std::string>());
+                }
+
+                // Update tool part with complete args so the DB has real input
                 auto partIt = toolParts.find(event.toolCall.id);
                 if (partIt != toolParts.end()) {
-                    // Part already created by ToolCallStart — update with final args
                     partIt->second.data["state"] = json::object({
                         {"status", "pending"},
                         {"input", input}
@@ -1356,6 +1384,12 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
                     m_sessionMgr.addPart(toolPart);
                     toolParts[event.toolCall.id] = toolPart;
                 }
+
+                // Push to toolCalls for execution after the stream finishes.
+                // Permission check happens later in executeToolCall(), where
+                // the DB part.data.state.input is already populated above.
+                toolCalls.push_back(event.toolCall);
+                hasToolCalls = true;
 
                 LOG_INFO("Tool call received: " + event.toolCall.name +
                          " (id=" + event.toolCall.id + ")");
@@ -1953,7 +1987,7 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
     //LOG_INFO("[runPrompt] step 10: entering main loop");
 
     // Main loop: keep calling LLM until no more tool calls
-    int maxRounds = 20;  // Safety limit
+    int maxRounds = 50;  // Safety limit
 
     // Use agent-specific maxSteps if available
     if (m_agents && !session->agentId.empty()) {
