@@ -36,4 +36,7 @@ private:
     };
     std::vector<PendingToolCall> m_pendingTools;
     bool m_textStarted = false;
+    // Usage data that arrived in a separate chunk (after finish_reason)
+    // and hasn't been attached to a StepFinish event yet.
+    json m_pendingUsage;
 };

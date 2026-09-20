@@ -28,6 +28,7 @@ struct SessionInfo {
     std::string version;
     std::string parentId;
     std::string directory;
+    std::vector<std::string> workingDirs;
     std::string model;
     std::string providerId;
     std::string agentId;
@@ -35,6 +36,7 @@ struct SessionInfo {
     double cost = 0;
     int64_t tokensInput = 0;
     int64_t tokensOutput = 0;
+    std::string preference;   // User preference injected into system prompt
     json metadata;
     int64_t timeCreated = 0;
     int64_t timeUpdated = 0;
@@ -96,6 +98,10 @@ public:
     // If messageId is provided, only copy messages up to and including that message
     SessionInfo forkSession(const std::string &sessionId, const std::string &messageId = "");
 
+    // Set the session's working directories (subset of global working dirs).
+    // If directory is empty or ".", also set directory = workingDirs[0].
+    void setSessionWorkingDirs(const std::string &sessionId, const std::vector<std::string> &dirs);
+
     // Archive/unarchive session
     bool archiveSession(const std::string &sessionId);
     bool unarchiveSession(const std::string &sessionId);
@@ -110,6 +116,18 @@ public:
     // List all sessions across all projects (for experimental/global session list)
     std::vector<SessionInfo> listAllSessions(int limit = 200, int offset = 0,
                                              bool includeArchived = false);
+
+    // Record daily token usage (UPSERT: accumulates into existing row if present)
+    void recordTokenUsage(const std::string &date, const std::string &providerId,
+                          const std::string &modelId,
+                          int64_t inputTokens, int64_t outputTokens,
+                          int64_t cacheRead = 0, int64_t cacheWrite = 0,
+                          int64_t reasoning = 0, double cost = 0.0);
+
+    // Query daily token usage. If date is empty, returns all dates.
+    // If providerId is empty, returns all providers for that date.
+    json getTokenUsage(const std::string &date = "",
+                       const std::string &providerId = "");
 
 private:
     void loadSessionsFromDb();

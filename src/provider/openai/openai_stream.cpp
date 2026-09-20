@@ -65,7 +65,15 @@ void OpenAIStreamParser::processLine(const std::string &line)
         }
 
         // Extract choices
-        if (!chunk.contains("choices") || chunk["choices"].empty()) return;
+        if (!chunk.contains("choices") || chunk["choices"].empty()) {
+            // Some providers send usage in a separate chunk after finish_reason
+            // with empty or missing choices. Capture it for later emission.
+            if (chunk.contains("usage") && chunk["usage"].is_object()) {
+                m_pendingUsage = chunk["usage"];
+                LOG_INFO("[OpenAI-Stream] captured delayed usage: " + m_pendingUsage.dump());
+            }
+            return;
+        }
 
         const auto &choice = chunk["choices"][0];
         // Streaming chunks carry "finish_reason": null; json::value() throws on JSON null,
@@ -89,9 +97,15 @@ void OpenAIStreamParser::processLine(const std::string &line)
             // flush point of the stream (v1 tool-stream semantics)
             flushPendingTools();
 
-            // Extract usage if available
-            if (chunk.contains("usage")) {
+            // Extract usage if it arrives in the same chunk as finish_reason
+            if (chunk.contains("usage") && chunk["usage"].is_object()) {
                 event.usage = chunk["usage"];
+                LOG_INFO("[OpenAI-Stream] StepFinish with usage: " + event.usage.dump());
+            } else if (!m_pendingUsage.is_null()) {
+                // Usage arrived earlier in a separate chunk — attach it now
+                event.usage = m_pendingUsage;
+                m_pendingUsage = nullptr;
+                LOG_INFO("[OpenAI-Stream] StepFinish with deferred usage: " + event.usage.dump());
             }
             m_callback(event);
         }
@@ -220,6 +234,16 @@ void OpenAIStreamParser::finish()
         end.type = LLMEvent::TextEnd;
         m_callback(end);
         m_textStarted = false;
+    }
+
+    // Emit delayed usage if it arrived after StepFinish and wasn't consumed
+    if (!m_pendingUsage.is_null() && m_pendingUsage.is_object()) {
+        LLMEvent usageEvent;
+        usageEvent.type = LLMEvent::Usage;
+        usageEvent.usage = m_pendingUsage;
+        m_pendingUsage = nullptr;
+        LOG_INFO("[OpenAI-Stream] emitting delayed Usage event: " + usageEvent.usage.dump());
+        m_callback(usageEvent);
     }
 
     LLMEvent done;

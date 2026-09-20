@@ -253,7 +253,8 @@ std::string SessionPrompt::buildSystemPrompt(const SessionInfo &session)
         }
     }
     std::string prompt = SystemPrompt::build(session.model, session.providerId, session.directory, m_config,
-                                              m_workingDirsGetter ? m_workingDirsGetter() : std::vector<std::string>{});
+                                              m_workingDirsGetter ? m_workingDirsGetter() : std::vector<std::string>{},
+                                              session.preference);
 
     // Inject memory context if available
     if (m_memory) {
@@ -587,6 +588,29 @@ static SnapshotManager *snapshotForPath(const std::vector<SnapshotManager*> &sna
     return result;
 }
 
+// Filter snapshots to only those whose worktree falls within the session's
+// working directories.  Falls back to all snapshots when the session has no
+// workingDirs set (backward compatible).
+static std::vector<SnapshotManager*> snapshotsForSession(
+        const std::vector<SnapshotManager*> &all,
+        const SessionInfo &session)
+{
+    if (session.workingDirs.empty()) return all;
+    std::vector<SnapshotManager*> result;
+    for (auto *sm : all) {
+        if (!sm || !sm->isInitialized()) continue;
+        std::string wt = normalizePathKey(sm->worktree());
+        for (const auto &wd : session.workingDirs) {
+            if (pathContains(normalizePathKey(wd), wt) ||
+                pathContains(wt, normalizePathKey(wd))) {
+                result.push_back(sm);
+                break;
+            }
+        }
+    }
+    return result;
+}
+
 ToolResult SessionPrompt::executeToolCall(const std::string &sessionId, const std::string &sessionDir,
                                            const ToolCall &tc)
 {
@@ -630,7 +654,9 @@ ToolResult SessionPrompt::executeToolCall(const std::string &sessionId, const st
         "glob", "read", "list", "search", "grep", "fetch",
         // skill only loads the skill's instruction content; any side-effect
         // tool it directs the model to run goes through its own check below.
-        "skill"
+        "skill",
+        // working_dir only queries/sets session directory scope, no file I/O
+        "working_dir"
     };
     bool isReadOnly = std::find(readOnlyTools.begin(), readOnlyTools.end(), tc.name)
                       != readOnlyTools.end();
@@ -741,13 +767,15 @@ ToolResult SessionPrompt::executeToolCall(const std::string &sessionId, const st
     }
 }
 
-void SessionPrompt::prepareToolSnapshots(const std::string &sessionDir,
+void SessionPrompt::prepareToolSnapshots(const std::string &sessionId,
+                                         const std::string &sessionDir,
                                          const std::vector<ToolCall> &toolCalls,
                                          json &stepStartHashes,
                                          json &promptStartHashes,
                                          Part &stepStartPart)
 {
-    auto snapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
+    auto allSnapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
+    auto snapshots = snapshotsForSession(allSnapshots, *m_sessionMgr.getSession(sessionId));
     if (snapshots.empty()) return;
 
     for (const auto &toolCall : toolCalls) {
@@ -1067,13 +1095,14 @@ void SessionPrompt::triggerMemoryExtraction(
     t.detach();
 }
 
-bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::string &sessionDir,
+RoundResult SessionPrompt::processLLMRound(const std::string &sessionId, const std::string &sessionDir,
                                      Message &assistantMsg,
                                      Provider *provider, const std::string &model,
                                      const Config::ModelConfig &modelCfg,
                                      std::vector<ChatMessage> &chatHistory,
                                      json &promptStartHashes)
 {
+    RoundResult roundResult;
     // Build LLM request
     LLMRequest request;
     request.model = model;
@@ -1094,6 +1123,13 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
     if (modelCfg.toolCall) {
         request.tools = m_tools.getToolDefinitions();
         request.toolChoice = "auto";
+        // Log which tools are being sent to the LLM
+        std::string toolNames;
+        for (const auto &t : request.tools) {
+            if (!toolNames.empty()) toolNames += ", ";
+            toolNames += t.name;
+        }
+        LOG_INFO("[processLLMRound] sending " + std::to_string(request.tools.size()) + " tools to LLM: " + toolNames);
     } else {
         // Model doesn't support tool calling — don't pass tools
         request.toolChoice = "none";
@@ -1481,6 +1517,21 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
                     // Update assistant message token data
                     assistantMsg.data["tokens"] = stepPart.data["tokens"];
                     assistantMsg.data["cost"] = cost;
+
+                    // Store in round result for session-level accumulation
+                    roundResult.inputTokens = inputT;
+                    roundResult.outputTokens = outputT;
+                    roundResult.cacheReadTokens = cacheR;
+                    roundResult.cacheWriteTokens = cacheW;
+                    roundResult.reasoningTokens = reasoningT;
+                    roundResult.cost = cost;
+
+                    LOG_INFO("[processLLMRound] usage: input=" + std::to_string(inputT)
+                             + " output=" + std::to_string(outputT)
+                             + " cache_read=" + std::to_string(cacheR)
+                             + " cache_write=" + std::to_string(cacheW)
+                             + " reasoning=" + std::to_string(reasoningT)
+                             + " cost=" + std::to_string(cost));
                 }
 
                 stepPart.timeCreated = util::nowMs();
@@ -1501,6 +1552,58 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
                         {"sessionID", sessionId},
                         {"error", error}
                     });
+                }
+            }
+            break;
+
+        case LLMEvent::Usage:
+            {
+                // Delayed usage report: arrived after StepFinish (separate chunk)
+                if (!event.usage.is_null() && event.usage.is_object()) {
+                    int64_t inputT = event.usage.value("prompt_tokens", 0);
+                    int64_t outputT = event.usage.value("completion_tokens", 0);
+                    int64_t cacheR = event.usage.value("cache_read_input_tokens", 0);
+                    int64_t cacheW = event.usage.value("cache_creation_input_tokens", 0);
+                    int64_t reasoningT = event.usage.value("reasoning_tokens", 0);
+
+                    // Only update if StepFinish didn't already capture usage
+                    if (roundResult.inputTokens == 0 && roundResult.outputTokens == 0) {
+                        roundResult.inputTokens = inputT;
+                        roundResult.outputTokens = outputT;
+                        roundResult.cacheReadTokens = cacheR;
+                        roundResult.cacheWriteTokens = cacheW;
+                        roundResult.reasoningTokens = reasoningT;
+
+                        double cost = 0.0;
+                        if (modelCfg.costInput > 0 || modelCfg.costOutput > 0) {
+                            cost += (static_cast<double>(inputT) / 1000000.0) * modelCfg.costInput;
+                            cost += (static_cast<double>(outputT) / 1000000.0) * modelCfg.costOutput;
+                            cost += (static_cast<double>(cacheR) / 1000000.0) * modelCfg.costCacheRead;
+                            cost += (static_cast<double>(cacheW) / 1000000.0) * modelCfg.costCacheWrite;
+                            cost += (static_cast<double>(reasoningT) / 1000000.0) * modelCfg.costOutput;
+                        } else {
+                            cost = CostCalculator::calculateCost(model, inputT, outputT, cacheR, cacheW, reasoningT);
+                        }
+                        roundResult.cost = cost;
+
+                        // Update step-finish part and assistant message with delayed usage
+                        if (stepFinishCreated) {
+                            lastStepFinishPart.data["tokens"] = json::object({
+                                {"input", inputT}, {"output", outputT},
+                                {"reasoning", reasoningT},
+                                {"cache_read", cacheR}, {"cache_write", cacheW}
+                            });
+                            lastStepFinishPart.data["cost"] = cost;
+                            lastStepFinishPart.timeUpdated = util::nowMs();
+                            m_sessionMgr.updatePart(lastStepFinishPart);
+                        }
+                        assistantMsg.data["tokens"] = lastStepFinishPart.data["tokens"];
+                        assistantMsg.data["cost"] = cost;
+
+                        LOG_INFO("[processLLMRound] delayed usage: input=" + std::to_string(inputT)
+                                 + " output=" + std::to_string(outputT)
+                                 + " cost=" + std::to_string(cost));
+                    }
                 }
             }
             break;
@@ -1558,7 +1661,7 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
                 {"sessionID", sessionId},
                 {"error", error}
             });
-            return false;
+            return roundResult;  // toolsCalled=false (default)
         }
     }  // end retry loop
 
@@ -1595,7 +1698,7 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
     recordStepEndState(sessionId, assistantMsg.id, multiHash,
                        lastStepFinishPart, stepFinishCreated);
     if (!hasToolCalls) {
-        return false;
+        return roundResult;  // toolsCalled=false (default)
     }
 
     // Execute tool calls and build results
@@ -1611,7 +1714,7 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
     // write stays on this thread, so part ordering and the chatHistory
     // replay order stay deterministic.
 
-    prepareToolSnapshots(sessionDir, toolCalls, multiHash, promptStartHashes, stepStartPart);
+    prepareToolSnapshots(sessionId, sessionDir, toolCalls, multiHash, promptStartHashes, stepStartPart);
     if (!multiHash.empty()) {
         assistantMsg.data["snapshotHash"] = multiHash.begin().value();
     }
@@ -1731,7 +1834,8 @@ bool SessionPrompt::processLLMRound(const std::string &sessionId, const std::str
     recordStepEndState(sessionId, assistantMsg.id, multiHash,
                        lastStepFinishPart, stepFinishCreated);
 
-    return true;  // Tools were called, need another round
+    roundResult.toolsCalled = true;
+    return roundResult;  // Tools were called, need another round
 }
 
 void SessionPrompt::recordStepEndState(const std::string &sessionId, const std::string &messageId,
@@ -1740,7 +1844,8 @@ void SessionPrompt::recordStepEndState(const std::string &sessionId, const std::
 {
     if (startSnapshot.empty() || !startSnapshot.is_object()) return;
 
-    auto snapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
+    auto allSnapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
+    auto snapshots = snapshotsForSession(allSnapshots, *m_sessionMgr.getSession(sessionId));
     if (snapshots.empty()) return;
 
     // Only worktrees whose potentially writing tools captured a baseline need
@@ -1799,7 +1904,8 @@ void SessionPrompt::recordStepEndState(const std::string &sessionId, const std::
 void SessionPrompt::publishFilesChanged(const std::string &sessionId,
                                          const json &promptStartHashes)
 {
-    auto snapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
+    auto allSnapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
+    auto snapshots = snapshotsForSession(allSnapshots, *m_sessionMgr.getSession(sessionId));
     if (snapshots.empty() || promptStartHashes.empty() || !promptStartHashes.is_object())
         return;
 
@@ -1915,6 +2021,11 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
         return;
     }
 
+    // If directory is empty or ".", fall back to first working dir
+    if ((session->directory.empty() || session->directory == ".") && !session->workingDirs.empty()) {
+        session->directory = session->workingDirs[0];
+    }
+
     // Update memory collector with current project context
     if (m_memory && !session->projectId.empty()) {
         m_memory->setCurrentProject(session->projectId);
@@ -1999,6 +2110,14 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
 
     int round = 0;
 
+    // Session-level token and cost accumulation across all rounds
+    int64_t sessionInputTokens = 0;
+    int64_t sessionOutputTokens = 0;
+    int64_t sessionCacheReadTokens = 0;
+    int64_t sessionCacheWriteTokens = 0;
+    int64_t sessionReasoningTokens = 0;
+    double sessionCost = 0.0;
+
     // Baselines are captured lazily when this prompt first invokes a
     // potentially writing tool in a worktree. Uninvolved projects are skipped.
     json promptStartHashes = json::object();
@@ -2023,7 +2142,15 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
         ++round;
         LOG_INFO("LLM round " + std::to_string(round) + " for session: " + sessionId);
 
-        bool toolsCalled = processLLMRound(sessionId, session->directory, assistantMsg, provider, model, modelCfg, chatHistory, promptStartHashes);
+        RoundResult rr = processLLMRound(sessionId, session->directory, assistantMsg, provider, model, modelCfg, chatHistory, promptStartHashes);
+
+        // Accumulate this round's tokens into session totals
+        sessionInputTokens += rr.inputTokens;
+        sessionOutputTokens += rr.outputTokens;
+        sessionCacheReadTokens += rr.cacheReadTokens;
+        sessionCacheWriteTokens += rr.cacheWriteTokens;
+        sessionReasoningTokens += rr.reasoningTokens;
+        sessionCost += rr.cost;
 
         // Auto-generate title after first round if conditions are met
         if (round == 1 && session->parentId.empty() &&
@@ -2049,7 +2176,7 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
             }
         }
 
-        if (!toolsCalled) {
+        if (!rr.toolsCalled) {
             // LLM finished without calling tools
             break;
         }
@@ -2087,6 +2214,36 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
 
     // Update assistant message with final data
     m_sessionMgr.addMessage(assistantMsg);  // UPDATE via INSERT OR REPLACE
+
+    // Persist session-level token and cost totals
+    if (sessionInputTokens > 0 || sessionOutputTokens > 0 || sessionCost > 0) {
+        session->tokensInput += sessionInputTokens;
+        session->tokensOutput += sessionOutputTokens;
+        session->cost += sessionCost;
+        m_sessionMgr.updateSession(sessionId, json::object({
+            {"tokens_input", session->tokensInput},
+            {"tokens_output", session->tokensOutput},
+            {"cost", session->cost}
+        }));
+        LOG_INFO("Prompt token summary for session " + sessionId
+                 + ": input=" + std::to_string(sessionInputTokens)
+                 + " output=" + std::to_string(sessionOutputTokens)
+                 + " cache_read=" + std::to_string(sessionCacheReadTokens)
+                 + " cache_write=" + std::to_string(sessionCacheWriteTokens)
+                 + " reasoning=" + std::to_string(sessionReasoningTokens)
+                 + " cost=" + std::to_string(sessionCost)
+                 + " (session total: input=" + std::to_string(session->tokensInput)
+                 + " output=" + std::to_string(session->tokensOutput)
+                 + " cost=" + std::to_string(session->cost) + ")");
+
+        // Record daily token usage statistics
+        m_sessionMgr.recordTokenUsage(
+            util::localDateStr(),
+            session->providerId, model,
+            sessionInputTokens, sessionOutputTokens,
+            sessionCacheReadTokens, sessionCacheWriteTokens,
+            sessionReasoningTokens, sessionCost);
+    }
 
     // Notify IDE which files this conversation turn changed
     publishFilesChanged(sessionId, promptStartHashes);

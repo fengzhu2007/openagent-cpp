@@ -24,8 +24,10 @@ json SessionInfo::toJson() const
     j["slug"] = slug;
     j["projectID"] = projectId;
     j["directory"] = directory;
+    if (!workingDirs.empty()) j["workingDirs"] = workingDirs;
     if (!parentId.empty()) j["parentID"] = parentId;
     j["title"] = title;
+    if (!preference.empty()) j["preference"] = preference;
     if (!agentId.empty()) j["agent"] = agentId;
     // Nested model object
     if (!model.empty() || !providerId.empty()) {
@@ -93,6 +95,7 @@ SessionInfo SessionInfo::fromRow(const json &row)
         s.cost = getDbl("cost", 0.0);
         s.tokensInput = getInt("tokens_input");
         s.tokensOutput = getInt("tokens_output");
+        s.preference = getStr("preference", "");
         s.timeCreated = getInt("time_created");
         s.timeUpdated = getInt("time_updated");
         s.timeArchived = getInt("time_archived");
@@ -287,6 +290,12 @@ bool SessionManager::updateSession(const std::string &id, const json &updates)
         if (updates.contains("provider_id")) s.providerId = updates["provider_id"].get<std::string>();
         if (updates.contains("agent_id")) s.agentId = updates["agent_id"].get<std::string>();
         if (updates.contains("metadata")) s.metadata = updates["metadata"];
+        if (updates.contains("tokens_input")) s.tokensInput = updates["tokens_input"].get<int64_t>();
+        if (updates.contains("tokens_output")) s.tokensOutput = updates["tokens_output"].get<int64_t>();
+        if (updates.contains("cost")) s.cost = updates["cost"].get<double>();
+        // preference/directory: contains() distinguishes absent (don't touch) from empty string (clear)
+        if (updates.contains("preference")) s.preference = updates["preference"].get<std::string>();
+        if (updates.contains("directory")) s.directory = updates["directory"].get<std::string>();
         for (auto &[key, val] : updates.items()) {
             if (key.rfind("metadata.", 0) == 0 && key.size() > 9) {
                 std::string subKey = key.substr(9);
@@ -582,6 +591,7 @@ SessionInfo SessionManager::forkSession(const std::string &sessionId, const std:
         newSession.version = parent.version;
         newSession.parentId = sessionId;
         newSession.directory = parent.directory;
+        newSession.workingDirs = parent.workingDirs;
         newSession.model = parent.model;
         newSession.providerId = parent.providerId;
         newSession.status = SessionStatus::Idle;
@@ -689,6 +699,29 @@ bool SessionManager::unarchiveSession(const std::string &sessionId)
     return true;
 }
 
+void SessionManager::setSessionWorkingDirs(const std::string &sessionId,
+                                            const std::vector<std::string> &dirs)
+{
+    json eventData;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_sessions.find(sessionId);
+        if (it == m_sessions.end()) return;
+
+        it->second.workingDirs = dirs;
+        // If directory is empty or ".", use the first working dir
+        if ((it->second.directory.empty() || it->second.directory == ".") && !dirs.empty()) {
+            it->second.directory = dirs[0];
+        }
+        it->second.timeUpdated = util::nowMs();
+        // workingDirs is in-memory only (no DB column); persist directory change
+        saveSessionToDb(it->second);
+        eventData = {{"sessionID", sessionId}, {"info", it->second.toJson()}};
+        LOG_INFO("Session workingDirs set: " + sessionId + " (" + std::to_string(dirs.size()) + " dirs)");
+    }
+    m_events.publish(EventType::SessionUpdated, eventData);
+}
+
 std::string SessionManager::regenerateFromMessage(const std::string &sessionId,
                                                     const std::string &messageId)
 {
@@ -791,17 +824,17 @@ void SessionManager::saveSessionToDb(const SessionInfo &s)
     bool ok = m_db.execute(
         "INSERT INTO session "
         "(id, project_id, title, version, parent_id, directory, model, provider_id, status, "
-        "cost, tokens_input, tokens_output, metadata, time_created, time_updated, time_archived) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "cost, tokens_input, tokens_output, preference, metadata, time_created, time_updated, time_archived) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, title=excluded.title, "
         "version=excluded.version, parent_id=excluded.parent_id, directory=excluded.directory, "
         "model=excluded.model, provider_id=excluded.provider_id, status=excluded.status, "
         "cost=excluded.cost, tokens_input=excluded.tokens_input, tokens_output=excluded.tokens_output, "
-        "metadata=excluded.metadata, time_updated=excluded.time_updated, time_archived=excluded.time_archived",
+        "preference=excluded.preference, metadata=excluded.metadata, time_updated=excluded.time_updated, time_archived=excluded.time_archived",
         {s.id, s.projectId, s.title, s.version,
          s.parentId.empty() ? json(nullptr) : json(s.parentId),
          s.directory, s.model, s.providerId, statusToString(s.status),
-         s.cost, s.tokensInput, s.tokensOutput, s.metadata.dump(),
+         s.cost, s.tokensInput, s.tokensOutput, s.preference, s.metadata.dump(),
          s.timeCreated, s.timeUpdated,
          s.timeArchived > 0 ? json(s.timeArchived) : json(nullptr)});
     if (!ok) {
@@ -854,4 +887,53 @@ void SessionManager::savePartToDb(const Part &part)
     if (!ok) {
         LOG_ERROR("savePartToDb failed for part " + part.id + " (message " + part.messageId + ")");
     }
+}
+
+void SessionManager::recordTokenUsage(const std::string &date, const std::string &providerId,
+                                       const std::string &modelId,
+                                       int64_t inputTokens, int64_t outputTokens,
+                                       int64_t cacheRead, int64_t cacheWrite,
+                                       int64_t reasoning, double cost)
+{
+    if (date.empty() || providerId.empty() || modelId.empty()) return;
+    if (inputTokens == 0 && outputTokens == 0) return;
+
+    bool ok = m_db.execute(
+        "INSERT INTO token_usage_daily "
+        "(date, provider_id, model_id, input_tokens, output_tokens, cache_read, cache_write, reasoning, cost) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(date, provider_id, model_id) DO UPDATE SET "
+        "input_tokens = input_tokens + excluded.input_tokens, "
+        "output_tokens = output_tokens + excluded.output_tokens, "
+        "cache_read = cache_read + excluded.cache_read, "
+        "cache_write = cache_write + excluded.cache_write, "
+        "reasoning = reasoning + excluded.reasoning, "
+        "cost = cost + excluded.cost",
+        {date, providerId, modelId,
+         inputTokens, outputTokens, cacheRead, cacheWrite, reasoning, cost});
+    if (!ok) {
+        LOG_ERROR("recordTokenUsage failed for " + date + " " + providerId + " " + modelId);
+    }
+}
+
+json SessionManager::getTokenUsage(const std::string &date, const std::string &providerId)
+{
+    std::string sql = "SELECT date, provider_id, model_id, input_tokens, output_tokens, "
+                      "cache_read, cache_write, reasoning, cost FROM token_usage_daily WHERE 1=1";
+    json params = json::array();
+
+    if (!date.empty()) {
+        sql += " AND date = ?";
+        params.push_back(date);
+    }
+    if (!providerId.empty()) {
+        sql += " AND provider_id = ?";
+        params.push_back(providerId);
+    }
+    sql += " ORDER BY date DESC, provider_id, model_id";
+
+    if (params.empty()) {
+        return m_db.query(sql);
+    }
+    return m_db.query(sql, params);
 }

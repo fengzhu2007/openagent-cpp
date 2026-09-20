@@ -28,7 +28,8 @@ std::string build(const std::string &modelId,
                   const std::string &providerId,
                   const std::string &directory,
                   const Config &config,
-                  const std::vector<std::string> &workingDirs)
+                  const std::vector<std::string> &workingDirs,
+                  const std::string &preference)
 {
     std::ostringstream ss;
 
@@ -41,7 +42,14 @@ std::string build(const std::string &modelId,
     // 2. Environment information
     ss << buildEnvironmentInfo(modelId, providerId, directory, workingDirs);
 
-    // 3. Instructions from AGENTS.md / config
+    // 3. User preference for this session (injected as system-level instruction)
+    if (!preference.empty()) {
+        ss << "\n<user_preference>\n";
+        ss << preference << "\n";
+        ss << "</user_preference>\n";
+    }
+
+    // 4. Instructions from AGENTS.md / config
     auto instructions = loadInstructions(directory, config);
     for (const auto &inst : instructions) {
         ss << "\n" << inst << "\n";
@@ -80,6 +88,18 @@ std::string buildEnvironmentInfo(const std::string &modelId,
     ss << "  Platform: " << platformName() << "\n";
     ss << "  Today's date: " << currentDateStr() << "\n";
     ss << "</env>\n";
+
+    // Guide LLM to use working_dir tool for session-scoped directory resolution
+    /*if (workingDirs.size() > 1) {
+        ss << "\n";
+        ss << "# Working directory resolution\n";
+        ss << "This session has access to multiple working directories. "
+           << "Before creating, writing, or editing files, you MUST first call the "
+           << "`working_dir` tool to determine which session working directory to use. "
+           << "Pass the target directory or let the tool return the current session directories. "
+           << "All file paths in subsequent tool calls (write, edit, read, shell) must be "
+           << "relative to or inside the resolved session working directory.\n";
+    }*/
 
     return ss.str();
 }

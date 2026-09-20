@@ -162,6 +162,22 @@ void Schema::migrate(Database &db)
         );
     )");
 
+    // Daily token usage statistics (per provider/model, local timezone date)
+    db.exec(R"(
+        CREATE TABLE IF NOT EXISTS token_usage_daily (
+            date            TEXT NOT NULL,
+            provider_id     TEXT NOT NULL,
+            model_id        TEXT NOT NULL,
+            input_tokens    INTEGER DEFAULT 0 NOT NULL,
+            output_tokens   INTEGER DEFAULT 0 NOT NULL,
+            cache_read      INTEGER DEFAULT 0 NOT NULL,
+            cache_write     INTEGER DEFAULT 0 NOT NULL,
+            reasoning       INTEGER DEFAULT 0 NOT NULL,
+            cost            REAL DEFAULT 0 NOT NULL,
+            PRIMARY KEY (date, provider_id, model_id)
+        );
+    )");
+
     // Indexes
     db.exec("CREATE INDEX IF NOT EXISTS idx_message_session ON message(session_id, time_created);");
     db.exec("CREATE INDEX IF NOT EXISTS idx_part_message ON part(message_id);");
@@ -188,6 +204,16 @@ void Schema::migrate(Database &db)
     }
     if (!hasEmbedding) {
         db.exec("ALTER TABLE memory ADD COLUMN embedding TEXT DEFAULT ''");
+    }
+
+    // Migration: add preference column to session table
+    auto sessionCols = db.query("PRAGMA table_info(session)");
+    bool hasPreference = false;
+    for (const auto &c : sessionCols) {
+        if (c.value("name", "") == "preference") { hasPreference = true; break; }
+    }
+    if (!hasPreference) {
+        db.exec("ALTER TABLE session ADD COLUMN preference TEXT DEFAULT ''");
     }
 
     LOG_INFO("Database schema migrated.");

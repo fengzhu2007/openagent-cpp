@@ -15,6 +15,7 @@ namespace fs = std::filesystem;
 
 #ifdef _WIN32
 #include <direct.h>
+#include <windows.h>
 #define PATH_SEP "\\"
 #else
 #include <unistd.h>
@@ -65,7 +66,13 @@ bool SnapshotManager::isGitRepo(const std::string &dir)
     std::array<char, 1024> buffer;
     std::string result;
 #ifdef _WIN32
-    FILE *pipe = _popen(cmd.c_str(), "r");
+    // Use wide _wpopen to pass UTF-8 paths through cmd.exe correctly
+    // (see gitExec for rationale — ANSI _popen mangles CJK bytes).
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) return false;
+    std::wstring wCmd(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, &wCmd[0], wlen);
+    FILE *pipe = _wpopen(wCmd.c_str(), L"r");
 #else
     FILE *pipe = popen(cmd.c_str(), "r");
 #endif
@@ -100,7 +107,14 @@ bool SnapshotManager::hasChanges() const
     std::array<char, 1024> buffer;
     std::string result;
 #ifdef _WIN32
-    FILE *pipe = _popen(cmd.c_str(), "r");
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) {
+        LOG_ERROR("[hasChanges] MultiByteToWideChar failed for: " + m_worktree);
+        return false;
+    }
+    std::wstring wCmd(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, &wCmd[0], wlen);
+    FILE *pipe = _wpopen(wCmd.c_str(), L"r");
 #else
     FILE *pipe = popen(cmd.c_str(), "r");
 #endif
@@ -147,12 +161,32 @@ void SnapshotManager::cleanup()
 
     std::error_code ec;
     if (fs::exists(m_repoPath, ec)) {
+#ifdef _WIN32
+        // On Windows, git bare repos have read-only object files.
+        // Use system command which handles read-only files natively.
+        // Convert to wide string for CJK path support.
+        std::wstring wPath(m_repoPath.size(), L'\0');
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, m_repoPath.c_str(), -1, &wPath[0], static_cast<int>(wPath.size()));
+        if (wlen > 0) {
+            wPath.resize(wlen - 1);  // -1 for null terminator
+            std::wstring cmd = L"cmd /c rd /s /q \"" + wPath + L"\"";
+            int ret = _wsystem(cmd.c_str());
+            if (ret != 0) {
+                LOG_ERROR("Failed to cleanup snapshot repo: " + m_repoPath + " - exit code " + std::to_string(ret));
+            } else {
+                LOG_INFO("Snapshot repo cleaned up: " + m_repoPath);
+            }
+        } else {
+            LOG_ERROR("Failed to convert path for cleanup: " + m_repoPath);
+        }
+#else
         fs::remove_all(m_repoPath, ec);
         if (ec) {
             LOG_ERROR("Failed to cleanup snapshot repo: " + m_repoPath + " - " + ec.message());
         } else {
             LOG_INFO("Snapshot repo cleaned up: " + m_repoPath);
         }
+#endif
     }
     m_initialized = false;
 }
@@ -294,16 +328,32 @@ std::string SnapshotManager::gitExec(const std::string &args, bool inWorktree) c
         cmd = "git " + args + " 2>&1";
     }
 
+    LOG_INFO("[gitExec] inWorktree=" + std::to_string(inWorktree) + " args=[" + args + "] cmd=[" + cmd + "]");
+
     std::array<char, 4096> buffer;
     std::string result;
 
 #ifdef _WIN32
-    FILE *pipe = _popen(cmd.c_str(), "r");
+    // Convert UTF-8 command to wide string so _wpopen calls CreateProcessW.
+    // The ANSI _popen uses CreateProcessA which interprets the command via
+    // the system code page (GBK on zh-CN Windows). UTF-8 bytes for CJK
+    // characters are invalid GBK sequences, causing cmd.exe to crash.
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) {
+        LOG_ERROR("[gitExec] MultiByteToWideChar failed for cmd: " + cmd);
+        return "";
+    }
+    std::wstring wCmd(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, &wCmd[0], wlen);
+    FILE *pipe = _wpopen(wCmd.c_str(), L"r");
 #else
     FILE *pipe = popen(cmd.c_str(), "r");
 #endif
 
-    if (!pipe) return "";
+    if (!pipe) {
+        LOG_ERROR("[gitExec] _popen returned NULL for cmd: " + cmd);
+        return "";
+    }
 
     size_t n;
     while ((n = fread(buffer.data(), 1, buffer.size(), pipe)) > 0) {
@@ -381,7 +431,8 @@ std::string SnapshotManager::track(bool forceInitialize)
     // This is much faster for large projects with node_modules etc.
     LOG_INFO("[track] running git status --porcelain...");
     std::string status = gitExec("-c core.quotepath=false status --porcelain -z --no-renames", true);
-    LOG_INFO("[track] git status done, output len=" + std::to_string(status.size()));
+    LOG_INFO("[track] git status done, output len=" + std::to_string(status.size())
+             + " raw=[" + status.substr(0, 500) + "]");
 
     if (status.empty()) {
         // No changes — just write the current tree
@@ -419,6 +470,9 @@ std::string SnapshotManager::track(bool forceInitialize)
     // Batch git add by command length, not only file count. Long Windows
     // paths can exceed cmd.exe's limit even when a batch has fewer than 200 files.
     if (!files.empty()) {
+        for (const auto &f : files) {
+            LOG_INFO("[track] changed file: [" + f + "]");
+        }
         LOG_INFO("[track] git add " + std::to_string(files.size()) + " files in batches...");
         const size_t maxBatchLength = 8000;
         std::string batch;

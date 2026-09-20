@@ -17,6 +17,17 @@
 #include <functional>
 #include <vector>
 
+// Result of a single LLM round, returned to the prompt loop for session-level accumulation
+struct RoundResult {
+    bool toolsCalled = false;
+    int64_t inputTokens = 0;
+    int64_t outputTokens = 0;
+    int64_t cacheReadTokens = 0;
+    int64_t cacheWriteTokens = 0;
+    int64_t reasoningTokens = 0;
+    double cost = 0.0;
+};
+
 // Core prompt loop: builds messages, calls LLM, executes tools, loops until done
 class SessionPrompt {
 public:
@@ -84,8 +95,8 @@ private:
     // Get the provider and model for a session
     Provider *resolveProvider(const SessionInfo &session, std::string &modelOut);
 
-    // Process a single LLM round: stream events, execute tools, return whether tools were called
-    bool processLLMRound(const std::string &sessionId, const std::string &sessionDir,
+    // Process a single LLM round: stream events, execute tools, return round result
+    RoundResult processLLMRound(const std::string &sessionId, const std::string &sessionDir,
                          Message &assistantMsg,
                          Provider *provider, const std::string &model,
                          const Config::ModelConfig &modelCfg,
@@ -94,7 +105,8 @@ private:
 
     // Capture a baseline only for worktrees targeted by potentially mutating
     // tool calls. Reuses one baseline for all writes in the same step.
-    void prepareToolSnapshots(const std::string &sessionDir,
+    void prepareToolSnapshots(const std::string &sessionId,
+                              const std::string &sessionDir,
                               const std::vector<ToolCall> &toolCalls,
                               json &stepStartHashes,
                               json &promptStartHashes,

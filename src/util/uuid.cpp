@@ -62,4 +62,13 @@ int64_t nowSec()
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+std::string localDateStr()
+{
+    auto now = std::chrono::system_clock::now();
+    auto time = std::chrono::system_clock::to_time_t(now);
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d", std::localtime(&time));
+    return std::string(buf);
+}
+
 } // namespace util

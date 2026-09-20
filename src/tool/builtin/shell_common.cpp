@@ -149,7 +149,11 @@ ToolResult executePopen(const std::string &command, int /*timeoutSec*/,
         // cmd.exe or default — _popen already uses cmd.exe on Windows
         fullCmd = cdPrefix + command + " 2>&1";
     }
-    FILE *pipe = _popen(fullCmd.c_str(), "r");
+    // Use _wpopen (CreateProcessW) so cmd.exe receives the command as
+    // UTF-16LE. The ANSI _popen interprets bytes via the system code page
+    // (GBK on zh-CN), mangling CJK characters in paths and commands.
+    std::wstring wCmd = utf8ToWide(fullCmd);
+    FILE *pipe = _wpopen(wCmd.c_str(), L"r");
 #else
     (void)shellType; // Unix always uses /bin/sh via popen
     std::string cdPrefix = cwd.empty() ? "" : "cd \"" + cwd + "\" && ";

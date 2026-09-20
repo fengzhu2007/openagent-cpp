@@ -11,7 +11,8 @@ std::string build(const std::string &modelId,
                   const std::string &providerId,
                   const std::string &directory,
                   const Config &config,
-                  const std::vector<std::string> &workingDirs = {});
+                  const std::vector<std::string> &workingDirs = {},
+                  const std::string &preference = "");
 
 // Build environment information block
 std::string buildEnvironmentInfo(const std::string &modelId,

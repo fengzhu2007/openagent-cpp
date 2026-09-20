@@ -15,4 +15,7 @@ int64_t nowMs();
 // Get current time in seconds since epoch
 int64_t nowSec();
 
+// Get current local date as "YYYY-MM-DD" string (local timezone)
+std::string localDateStr();
+
 } // namespace util

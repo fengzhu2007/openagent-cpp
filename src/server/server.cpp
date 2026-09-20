@@ -8,6 +8,7 @@
 #include "tool/builtin/shell_common.h"
 #include "tool/builtin/skill_tool.h"
 #include "tool/builtin/task_tool.h"
+#include "tool/builtin/working_dir_tool.h"
 #include <thread>
 #include <chrono>
 #include <queue>
@@ -18,7 +19,20 @@
 #include <map>
 #ifdef _WIN32
 #include <windows.h>
-#define POPEN _popen
+
+// Wide-char popen: converts UTF-8 command to UTF-16LE so cmd.exe receives
+// the command via CreateProcessW. The ANSI _popen uses CreateProcessA which
+// interprets bytes via the system code page (GBK on zh-CN), mangling CJK.
+static FILE *utf8Popen(const char *utf8Cmd, const char *mode)
+{
+    std::wstring wCmd;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8Cmd, -1, nullptr, 0);
+    if (wlen <= 0) return _popen(utf8Cmd, mode);  // fallback for pure ASCII
+    wCmd.resize(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8Cmd, -1, &wCmd[0], wlen);
+    return _wpopen(wCmd.c_str(), L"r");
+}
+#define POPEN(cmd, mode) utf8Popen(cmd, mode)
 #define PCLOSE _pclose
 #define DEVNULL "NUL"
 #else
@@ -175,6 +189,8 @@ Server::Server(const std::string &host, uint16_t port,
     // child session's actual tool calls go through the same permission boundary.
     m_tools.registerTool(std::make_unique<TaskTool>(m_sessionMgr, m_providers, m_tools, m_events, m_config,
                                                     m_permission.get(), [this]() { return workingDirs(); }));
+    // Register WorkingDirTool (returns global working dirs or a validated subset)
+    m_tools.registerTool(std::make_unique<WorkingDirTool>(m_sessionMgr, [this]() { return workingDirs(); }));
     // Workspace, Sync, Project managers (D2-D4)
     m_workspaces = std::make_unique<WorkspaceManager>(m_db);
     m_sync = std::make_unique<SyncManager>(m_db, m_events);
@@ -943,6 +959,11 @@ void Server::setupRoutes()
     });
     m_httpServer.Post(R"(/experimental/project/([^/]+)/copy/refresh)", [this](const httplib::Request &req, httplib::Response &res) {
         handleProjectCopyRefresh(req, res);
+    });
+
+    // Token usage statistics
+    m_httpServer.Get("/token-usage", [this](const httplib::Request &req, httplib::Response &res) {
+        handleTokenUsage(req, res);
     });
 
     LOG_DEBUG("All routes registered.");
@@ -4710,4 +4731,22 @@ void Server::handleProjectCopyRefresh(const httplib::Request &req, httplib::Resp
 {
     // Stub: project copy refresh not yet implemented
     middleware::sendNoContent(res);
+}
+
+// ---- Token Usage Statistics ----
+
+void Server::handleTokenUsage(const httplib::Request &req, httplib::Response &res)
+{
+    // Query params: ?date=YYYY-MM-DD&provider_id=xxx
+    std::string date;
+    std::string providerId;
+    if (req.has_param("date")) {
+        date = req.get_param_value("date");
+    }
+    if (req.has_param("provider_id")) {
+        providerId = req.get_param_value("provider_id");
+    }
+
+    json rows = m_sessionMgr.getTokenUsage(date, providerId);
+    middleware::sendJSON(res, rows.dump(), 200);
 }

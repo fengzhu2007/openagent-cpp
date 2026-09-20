@@ -65,6 +65,7 @@ struct LLMEvent {
         ToolCallEnd,
         ReasoningDelta,
         StepFinish,
+        Usage,          // delayed usage report (arrives after stream finish)
         Error,
         Done
     };

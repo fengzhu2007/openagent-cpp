@@ -146,6 +146,10 @@ json OpenAIProvider::buildRequestBody(const LLMRequest &request, bool streaming)
     json body;
     body["model"] = request.model;
     body["stream"] = streaming;
+    // Request usage data in streaming mode so we can track token consumption
+    if (streaming) {
+        body["stream_options"] = json::object({{"include_usage", true}});
+    }
     // Only send temperature if it's non-negative (-1.0 means "don't send")
     if (request.temperature >= 0) {
         body["temperature"] = request.temperature;

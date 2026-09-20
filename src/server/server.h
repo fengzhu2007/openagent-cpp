@@ -276,6 +276,9 @@ private:
     void handleProjectCopyRemove(const httplib::Request &req, httplib::Response &res);
     void handleProjectCopyRefresh(const httplib::Request &req, httplib::Response &res);
 
+    // Token usage statistics
+    void handleTokenUsage(const httplib::Request &req, httplib::Response &res);
+
     // Snapshot helpers: find the right SnapshotManager for a given path,
     // or get the first available one for session-level operations.
     SnapshotManager *snapshotFor(const std::string &absPath);
