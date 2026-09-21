@@ -171,6 +171,12 @@ void SessionPrompt::setSnapshotsGetter(std::function<std::vector<SnapshotManager
     m_snapshotsGetter = std::move(getter);
 }
 
+void SessionPrompt::excludeTool(const std::string &name)
+{
+    // Called during child-prompt setup, before prompt() starts — no locking
+    m_excludedTools.push_back(name);
+}
+
 void SessionPrompt::prompt(const std::string &sessionId, const std::string &userText,
                            const json &inputParts)
 {
@@ -179,6 +185,9 @@ void SessionPrompt::prompt(const std::string &sessionId, const std::string &user
         std::lock_guard<std::mutex> lock(m_threadsMutex);
         m_abortFlags[sessionId] = false;
     }
+    // Drop any stale global abort request from a previous run so the new
+    // prompt does not stop at its first round boundary
+    m_sessionMgr.clearAbortRequest(sessionId);
     try {
         runPrompt(sessionId, userText, inputParts);
     } catch (...) {
@@ -203,6 +212,9 @@ void SessionPrompt::promptAsync(const std::string &sessionId, const std::string 
 
     // Initialize abort flag
     m_abortFlags[sessionId] = false;
+
+    // Drop any stale global abort request from a previous run
+    m_sessionMgr.clearAbortRequest(sessionId);
 
     // Spawn thread
     m_threads.emplace(sessionId, std::thread([this, sessionId, userText, inputParts]() {
@@ -229,11 +241,18 @@ void SessionPrompt::promptAsync(const std::string &sessionId, const std::string 
 
 void SessionPrompt::abort(const std::string &sessionId)
 {
-    std::lock_guard<std::mutex> lock(m_threadsMutex);
-    auto it = m_abortFlags.find(sessionId);
-    if (it != m_abortFlags.end()) {
-        it->second = true;
+    {
+        std::lock_guard<std::mutex> lock(m_threadsMutex);
+        auto it = m_abortFlags.find(sessionId);
+        if (it != m_abortFlags.end()) {
+            it->second = true;
+        }
     }
+    // Register globally too: sessions running on other SessionPrompt
+    // instances (e.g. todo_write children on ephemeral instances) cannot see
+    // this instance's flags. Children stop cooperatively: runPrompt polls
+    // the session's own global flag plus its parent's, so aborting the
+    // parent unwinds the whole todo plan at each generation's round boundary.
     m_sessionMgr.abortSession(sessionId);
 }
 
@@ -278,13 +297,49 @@ std::string SessionPrompt::buildSystemPrompt(const SessionInfo &session)
 std::vector<ChatMessage> SessionPrompt::buildChatMessages(const std::string &sessionId)
 {
     std::vector<ChatMessage> chatMessages;
-    auto messages = m_sessionMgr.getMessages(sessionId, 1000);
 
-    for (const auto &msg : messages) {
+    // Load only status=normal messages (excludes compacted-away messages)
+    auto normalRows = m_sessionMgr.getMessages(sessionId, 1000);
+
+    // Filter to status=normal, excluding role=compact (those are loaded
+    // separately via the compact summary query below to avoid duplicates).
+    std::vector<Message> messages;
+    for (auto &m : normalRows) {
+        if (m.status == "normal" && m.role != MessageRole::Compact) {
+            messages.push_back(std::move(m));
+        }
+    }
+
+    // Also load the latest compact summary (the most recent message with
+    // role=compact).  This represents all previously compacted history.
+    auto compactRows = m_sessionMgr.database().query(
+        "SELECT * FROM (SELECT * FROM message WHERE session_id = ? AND role = 'compact' "
+        "ORDER BY time_created DESC LIMIT 1) ORDER BY time_created ASC",
+        {sessionId});
+
+    // Parse compact summary messages and prepend them before normal messages
+    // so the LLM sees: [summary] [recent conversation...]
+    // Compact messages store their text in data.content (no parts).
+    std::vector<Message> compactMessages;
+    for (const auto &row : compactRows) {
+        Message msg;
+        msg.id = row.value("id", "");
+        msg.sessionId = row.value("session_id", "");
+        msg.role = MessageRole::User;  // role=compact → user for LLM
+        msg.status = "normal";          // loaded as normal for this request
+        msg.timeCreated = row.value("time_created", int64_t(0));
+        msg.timeUpdated = row.value("time_updated", int64_t(0));
+        std::string dataStr = row.value("data", "{}");
+        try { msg.data = json::parse(dataStr); } catch (...) { msg.data = json::object(); }
+        // No parts to load — text is in msg.data["content"]
+        compactMessages.push_back(msg);
+    }
+
+    // Process compact summaries first, then normal messages
+    auto processMessage = [&](const Message &msg, bool isCompact) {
         if (msg.role == MessageRole::System) {
             ChatMessage cm;
             cm.role = "system";
-            // Extract text from parts
             for (const auto &part : msg.parts) {
                 if (part.type == "text" && part.data.contains("text")) {
                     cm.content += part.data["text"].get<std::string>();
@@ -294,7 +349,7 @@ std::vector<ChatMessage> SessionPrompt::buildChatMessages(const std::string &ses
                 cm.content = msg.data["content"].get<std::string>();
             }
             chatMessages.push_back(cm);
-            continue;
+            return;
         }
 
         if (msg.role == MessageRole::User) {
@@ -304,10 +359,10 @@ std::vector<ChatMessage> SessionPrompt::buildChatMessages(const std::string &ses
             for (const auto &part : msg.parts) {
                 if (part.type == "compaction") { compactionMarker = true; break; }
             }
-            if (compactionMarker) continue;
+            if (compactionMarker) return;
 
             ChatMessage cm;
-            cm.role = "user";
+            cm.role = isCompact ? "user" : "user";  // compact → user (both are user)
             for (const auto &part : msg.parts) {
                 if (part.type == "text" && part.data.contains("text")) {
                     if (!cm.content.empty()) cm.content += "\n";
@@ -405,7 +460,7 @@ std::vector<ChatMessage> SessionPrompt::buildChatMessages(const std::string &ses
                 cm.content = msg.data["content"].get<std::string>();
             }
             chatMessages.push_back(cm);
-            continue;
+            return;
         }
 
         if (msg.role == MessageRole::Assistant) {
@@ -507,6 +562,15 @@ std::vector<ChatMessage> SessionPrompt::buildChatMessages(const std::string &ses
                 }
             }
         }
+    };
+
+    // Process compact summaries first (they have earlier timestamps)
+    for (const auto &msg : compactMessages) {
+        processMessage(msg, true);
+    }
+    // Then normal messages
+    for (const auto &msg : messages) {
+        processMessage(msg, false);
     }
 
     return chatMessages;
@@ -623,6 +687,18 @@ ToolResult SessionPrompt::executeToolCall(const std::string &sessionId, const st
         return r;
     }
 
+    // Defense in depth: a tool hidden from the LLM (excludeTool) must not
+    // execute even if the model hallucinates a call to it
+    for (const auto &ex : m_excludedTools) {
+        if (ex == tc.name) {
+            ToolResult r;
+            r.success = false;
+            r.error = "Tool '" + tc.name + "' is not available in this session";
+            r.title = "tool: " + tc.name;
+            return r;
+        }
+    }
+
     // Working directory for the tool: the session directory when known,
     // otherwise the first global working directory. Matches opencode, where
     // tools resolve relative paths against instance.directory. "." is the
@@ -665,8 +741,10 @@ ToolResult SessionPrompt::executeToolCall(const std::string &sessionId, const st
     // runs its child session with this same permission manager, so the
     // boundary is enforced on the tools the child actually invokes — asking
     // for the task call itself would only double-gate (matches opencode,
-    // where the Task agent tool is permission-free).
-    bool isOrchestrationTool = tc.name == "task";
+    // where the Task agent tool is permission-free). The todo tool is the
+    // same: it only persists a task plan and spawns child sessions whose
+    // real tool calls go through this same permission boundary.
+    bool isOrchestrationTool = tc.name == "task" || tc.name == "todo_write";
 
     // Permission check before tool execution.
     // By this point the DB part.data.state.input is already populated with
@@ -815,81 +893,156 @@ void SessionPrompt::prepareToolSnapshots(const std::string &sessionId,
     m_sessionMgr.updatePart(stepStartPart);
 }
 
-bool SessionPrompt::checkAndCompact(std::vector<ChatMessage> &chatHistory, Provider *provider,
-                                     const std::string &model, const Config::ModelConfig &modelCfg,
+void SessionPrompt::checkAndCompact(Provider *provider, const std::string &model,
+                                     const Config::ModelConfig &modelCfg,
                                      const std::string &sessionId)
 {
-    // Use config limit if set, otherwise fall back to hardcoded lookup table
-    int contextLimit = modelCfg.contextLimit > 0
-        ? modelCfg.contextLimit
-        : Compaction::getContextLimit(model);
-    auto estimate = Compaction::estimateTokens(chatHistory);
+    // Fixed 200K context window
+    static const int CONTEXT_LIMIT = 200000;
+    int budget = Compaction::usableContext(CONTEXT_LIMIT);  // 200000 - 8192 - 20000 = 171808
 
-    // Prune old tool outputs first (low-risk, no LLM call needed)
-    int pruned = Compaction::pruneToolOutputs(chatHistory);
-    if (pruned > 0) {
-        LOG_INFO("Pruned " + std::to_string(pruned) + " old tool outputs");
+    Database &db = m_sessionMgr.database();
+
+    // Load all status=normal messages from DB (these are the messages that
+    // will be sent to the LLM).  The latest user prompt is among these.
+    auto normalRows = db.query(
+        "SELECT * FROM message WHERE session_id = ? AND status = 'normal' "
+        "ORDER BY time_created ASC",
+        {sessionId});
+
+    if (normalRows.size() <= 2) {
+        return;  // Too few messages to compact
     }
 
-    // Re-estimate after pruning
-    estimate = Compaction::estimateTokens(chatHistory);
-    int budget = Compaction::usableContext(contextLimit);
+    // Load full Message objects (with parts) for token estimation.
+    // Only count text-type parts and user-sent content (~4 chars per token).
+    std::vector<Message> normalMessages;
+    int totalChars = 0;
+    for (const auto &row : normalRows) {
+        Message msg;
+        msg.id = row.value("id", "");
+        msg.sessionId = row.value("session_id", "");
+        msg.role = stringToRole(row.value("role", "user"));
+        msg.status = row.value("status", "normal");
+        msg.timeCreated = row.value("time_created", int64_t(0));
+        msg.timeUpdated = row.value("time_updated", int64_t(0));
+        std::string dataStr = row.value("data", "{}");
+        try { msg.data = json::parse(dataStr); } catch (...) { msg.data = json::object(); }
+        msg.parts = m_sessionMgr.getParts(msg.id);
 
-    if (estimate.total <= budget) {
-        return false;  // No compaction needed
+        // Count only text parts (actual content sent to LLM)
+        for (const auto &part : msg.parts) {
+            if (part.type == "text" && part.data.contains("text")) {
+                totalChars += static_cast<int>(part.data["text"].get<std::string>().size());
+            }
+        }
+        // Also count user-sent content (message.data.content)
+        if (msg.role == MessageRole::User && msg.data.contains("content")) {
+            totalChars += static_cast<int>(msg.data["content"].get<std::string>().size());
+        }
+        normalMessages.push_back(std::move(msg));
     }
 
-    LOG_INFO("Context overflow detected: " + std::to_string(estimate.total) +
+    int estimatedTokens = totalChars / 4 + static_cast<int>(normalMessages.size()) * 4;
+    if (estimatedTokens <= budget) {
+        return;  // No compaction needed
+    }
+
+    LOG_INFO("Context overflow detected: ~" + std::to_string(estimatedTokens) +
              " tokens, budget: " + std::to_string(budget) + ". Compacting...");
 
-    // Select which messages to keep (most recent within budget)
-    auto keepIndices = Compaction::selectMessages(chatHistory, budget / 2);  // Use half budget for safety
+    // Determine which messages to summarize.
+    // The LAST normal message is always excluded — it is the latest user
+    // prompt that was just saved.  We also keep the most recent N messages
+    // (within half the token budget) so the conversation remains coherent.
+    //
+    // Walk backwards from the second-to-last message to find which older
+    // messages to summarize.
+    int keepTokens = 0;
+    int halfBudget = budget / 2;
+    size_t summarizeEnd = normalMessages.size() - 1;  // exclusive: don't touch last msg
 
-    if (keepIndices.size() <= 2) {
-        LOG_WARN("Cannot compact further, too few messages");
-        return false;
+    for (int i = static_cast<int>(normalMessages.size()) - 2; i >= 0; --i) {
+        int msgChars = 0;
+        for (const auto &part : normalMessages[i].parts) {
+            if (part.type == "text" && part.data.contains("text")) {
+                msgChars += static_cast<int>(part.data["text"].get<std::string>().size());
+            }
+        }
+        if (normalMessages[i].role == MessageRole::User &&
+            normalMessages[i].data.contains("content")) {
+            msgChars += static_cast<int>(normalMessages[i].data["content"].get<std::string>().size());
+        }
+        int msgTokens = msgChars / 4 + 4;
+        if (keepTokens + msgTokens > halfBudget) break;
+        keepTokens += msgTokens;
+        summarizeEnd = static_cast<size_t>(i);
     }
 
-    // Messages to summarize (those not in keepIndices, excluding system)
-    std::vector<ChatMessage> toSummarize;
-    std::unordered_set<size_t> keepSet(keepIndices.begin(), keepIndices.end());
+    if (summarizeEnd == 0) {
+        return;  // Nothing to summarize
+    }
 
-    for (size_t i = 1; i < chatHistory.size(); ++i) {  // Skip system message
-        if (keepSet.find(i) == keepSet.end()) {
-            toSummarize.push_back(chatHistory[i]);
+    // Build ChatMessage vector for the summarizer (messages to compress)
+    std::vector<ChatMessage> toSummarize;
+    for (size_t i = 0; i < summarizeEnd; ++i) {
+        ChatMessage cm;
+        cm.role = (normalMessages[i].role == MessageRole::User) ? "user" : "assistant";
+        for (const auto &part : normalMessages[i].parts) {
+            if (part.type == "text" && part.data.contains("text")) {
+                if (!cm.content.empty()) cm.content += "\n";
+                cm.content += part.data["text"].get<std::string>();
+            }
+        }
+        if (cm.content.empty() && normalMessages[i].data.contains("content")) {
+            cm.content = normalMessages[i].data["content"].get<std::string>();
+        }
+        if (!cm.content.empty()) {
+            toSummarize.push_back(cm);
         }
     }
 
     if (toSummarize.empty()) {
-        return false;
+        return;
     }
 
     // Generate summary via LLM
     std::string summary = Compaction::compact(provider, model, toSummarize);
     if (summary.empty()) {
         LOG_WARN("Compaction summary generation failed");
-        return false;
+        return;
     }
 
-    // Rebuild chat history: system + summary + kept messages
-    ChatMessage systemMsg = chatHistory[0];  // Keep system prompt
-    std::vector<ChatMessage> newHistory;
-    newHistory.push_back(systemMsg);
+    // ---- Persist compaction to database ----
 
-    // Add summary as a user message
-    ChatMessage summaryMsg;
-    summaryMsg.role = "user";
-    summaryMsg.content = "[Conversation Summary]\n" + summary +
-                         "\n[End of Summary - conversation continues below]";
-    newHistory.push_back(summaryMsg);
-
-    // Add kept messages
-    for (size_t idx : keepIndices) {
-        if (idx == 0) continue;  // Already added system
-        newHistory.push_back(chatHistory[idx]);
+    // Mark old messages as compact (those before summarizeEnd)
+    for (size_t i = 0; i < summarizeEnd; ++i) {
+        db.execute("UPDATE message SET status = 'compact' WHERE id = ?",
+                   {normalMessages[i].id});
     }
+    LOG_INFO("Marked " + std::to_string(summarizeEnd) + " messages as compact in DB");
 
-    chatHistory = std::move(newHistory);
+    // Insert summary as a new message with role='compact', status='normal'.
+    // Summary text is stored directly in message.data.content (no part record).
+    int64_t now = util::nowMs();
+    Message summaryMsg;
+    summaryMsg.id = util::uuid4();
+    summaryMsg.sessionId = sessionId;
+    summaryMsg.role = MessageRole::Compact;  // role=compact in DB
+    summaryMsg.status = "normal";
+    summaryMsg.timeCreated = now;
+    summaryMsg.timeUpdated = now;
+    summaryMsg.data = {{"content", summary}};
+
+    // Persist summary message to DB
+    std::string dataStr;
+    try { dataStr = summaryMsg.data.dump(); } catch (...) { dataStr = "{}"; }
+    db.execute(
+        "INSERT INTO message (id, session_id, role, status, data, time_created, time_updated) "
+        "VALUES (?, ?, 'compact', 'normal', ?, ?, ?)",
+        {summaryMsg.id, sessionId, dataStr, now, now});
+
+    LOG_INFO("Persisted compact summary to DB (" + std::to_string(summary.size()) + " chars)");
 
     // Publish compaction event
     m_events.publish(EventType::SessionUpdated, json::object({
@@ -898,8 +1051,8 @@ bool SessionPrompt::checkAndCompact(std::vector<ChatMessage> &chatHistory, Provi
         {"summaryLength", static_cast<int>(summary.size())}
     }));
 
-    LOG_INFO("Compaction complete. New history: " + std::to_string(chatHistory.size()) + " messages");
-    return true;
+    LOG_INFO("Compaction complete. Marked " + std::to_string(summarizeEnd) +
+             " messages as compact, summary persisted.");
 }
 
 void SessionPrompt::generateTitleAsync(const std::string &sessionId, Provider *provider,
@@ -1122,6 +1275,20 @@ RoundResult SessionPrompt::processLLMRound(const std::string &sessionId, const s
     // Apply model config: tool_call capability
     if (modelCfg.toolCall) {
         request.tools = m_tools.getToolDefinitions();
+        // Hide excluded tools (e.g. todo_write in child sessions) so
+        // sub-tasks cannot create nested todo plans
+        if (!m_excludedTools.empty()) {
+            std::vector<ToolDefinition> filtered;
+            filtered.reserve(request.tools.size());
+            for (auto &def : request.tools) {
+                bool excluded = false;
+                for (const auto &name : m_excludedTools) {
+                    if (def.name == name) { excluded = true; break; }
+                }
+                if (!excluded) filtered.push_back(std::move(def));
+            }
+            request.tools = std::move(filtered);
+        }
         request.toolChoice = "auto";
         // Log which tools are being sent to the LLM
         std::string toolNames;
@@ -1819,6 +1986,10 @@ RoundResult SessionPrompt::processLLMRound(const std::string &sessionId, const s
         } else {
             state["error"] = toolResult.error.empty() ? toolResult.output : toolResult.error;
         }
+        // Structured result (e.g. todo plan final task statuses) survives in
+        // the DB part so history reloads can restore rich card state.
+        if (!toolResult.metadata.is_null())
+            state["metadata"] = toolResult.metadata;
         p.data["state"] = state;
         p.timeUpdated = util::nowMs();
         // updatePart saves to DB and publishes PartUpdated event
@@ -2051,7 +2222,13 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
     //LOG_INFO("[runPrompt] step 5: resolveModelConfig");
     Config::ModelConfig modelCfg = m_config.resolveModelConfig(session->providerId, model);
 
-    // Build chat messages
+    // Check context window and compact BEFORE building chat messages.
+    // This ensures the DB is already in a clean state: old messages are
+    // marked compact, and the compact summary is persisted.  The latest
+    // user message (just saved above) is never compressed.
+    checkAndCompact(provider, model, modelCfg, sessionId);
+
+    // Build chat messages (loads only status=normal + latest compact summary)
     //LOG_INFO("[runPrompt] step 6: buildChatMessages");
     auto chatHistory = buildChatMessages(sessionId);
 
@@ -2123,20 +2300,28 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
     json promptStartHashes = json::object();
 
     while (round < maxRounds) {
-        // Check abort flag
+        // Check abort flag: instance-local first, then the process-global
+        // registry. A child session additionally honors its parent's global
+        // flag, so aborting the parent stops the whole todo plan cooperatively
+        // (each generation polls at its own round boundary).
+        bool aborted = false;
         {
             std::lock_guard<std::mutex> lock(m_threadsMutex);
             auto it = m_abortFlags.find(sessionId);
-            if (it != m_abortFlags.end() && it->second) {
-                LOG_INFO("Prompt aborted for session: " + sessionId);
-                // v1 cleanup: pending/running tool parts become interrupted
-                // errors instead of hanging in the transcript forever
-                finalizeInterruptedToolParts(sessionId, assistantMsg.id);
-                // Notify IDE about files changed so far (even on abort)
-                publishFilesChanged(sessionId, promptStartHashes);
-                m_sessionMgr.setStatus(sessionId, SessionStatus::Idle);
-                return;
-            }
+            aborted = it != m_abortFlags.end() && it->second;
+        }
+        if (!aborted) aborted = m_sessionMgr.isAbortRequested(sessionId);
+        if (!aborted && !session->parentId.empty())
+            aborted = m_sessionMgr.isAbortRequested(session->parentId);
+        if (aborted) {
+            LOG_INFO("Prompt aborted for session: " + sessionId);
+            // v1 cleanup: pending/running tool parts become interrupted
+            // errors instead of hanging in the transcript forever
+            finalizeInterruptedToolParts(sessionId, assistantMsg.id);
+            // Notify IDE about files changed so far (even on abort)
+            publishFilesChanged(sessionId, promptStartHashes);
+            m_sessionMgr.setStatus(sessionId, SessionStatus::Idle);
+            return;
         }
 
         ++round;
@@ -2183,33 +2368,10 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
 
         LOG_INFO("Tools were called, starting round " + std::to_string(round + 1));
 
-        // Check context window usage and compact if needed
-        if (checkAndCompact(chatHistory, provider, model, modelCfg, sessionId)) {
-            // Record the compaction in the transcript (v1 semantics: a synthetic
-            // user message with a CompactionPart marks where the context was
-            // compacted; the in-flight history was already rewritten above)
-            Message compactMsg;
-            compactMsg.id = util::uuid4();
-            compactMsg.sessionId = sessionId;
-            compactMsg.role = MessageRole::User;
-            compactMsg.timeCreated = util::nowMs();
-            compactMsg.timeUpdated = compactMsg.timeCreated;
-            compactMsg.data = {
-                {"agent", session->agentId.empty() ? "build" : session->agentId},
-                {"providerID", session->providerId},
-                {"model", session->model}
-            };
-            Part compactPart;
-            compactPart.id = util::uuid4();
-            compactPart.messageId = compactMsg.id;
-            compactPart.sessionId = sessionId;
-            compactPart.type = "compaction";
-            compactPart.data = json::object({{"auto", true}});
-            compactPart.timeCreated = compactMsg.timeCreated;
-            compactPart.timeUpdated = compactMsg.timeCreated;
-            compactMsg.parts.push_back(compactPart);
-            m_sessionMgr.addMessage(compactMsg);
-        }
+        // Note: context compaction is handled at the start of each prompt
+        // (before buildChatMessages), not in the tool loop.  This ensures
+        // the latest user message is never compressed and the DB is in a
+        // clean state when the LLM context is assembled.
     }
 
     // Update assistant message with final data

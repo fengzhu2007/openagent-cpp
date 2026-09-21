@@ -7,7 +7,8 @@
 #include "tool/builtin/shell_tool.h"
 #include "tool/builtin/shell_common.h"
 #include "tool/builtin/skill_tool.h"
-#include "tool/builtin/task_tool.h"
+// #include "tool/builtin/task_tool.h"  // TaskTool temporarily disabled
+#include "tool/builtin/todo_tool.h"
 #include "tool/builtin/working_dir_tool.h"
 #include <thread>
 #include <chrono>
@@ -184,13 +185,14 @@ Server::Server(const std::string &host, uint16_t port,
     m_skills->loadFromConfig(m_config.data());
     // Register SkillTool
     m_tools.registerTool(std::make_unique<SkillTool>(*m_skills));
-    // Register TaskTool (sub-task in child session; reads parent ID from thread-local).
-    // It inherits the permission manager and working-dirs getter so the
-    // child session's actual tool calls go through the same permission boundary.
-    m_tools.registerTool(std::make_unique<TaskTool>(m_sessionMgr, m_providers, m_tools, m_events, m_config,
-                                                    m_permission.get(), [this]() { return workingDirs(); }));
+    // TaskTool temporarily disabled — not registered, not submitted to LLM.
+    // m_tools.registerTool(std::make_unique<TaskTool>(m_sessionMgr, m_providers, m_tools, m_events, m_config,
+    //                                                 m_permission.get(), [this]() { return workingDirs(); }));
     // Register WorkingDirTool (returns global working dirs or a validated subset)
     m_tools.registerTool(std::make_unique<WorkingDirTool>(m_sessionMgr, [this]() { return workingDirs(); }));
+    // Register TodoTool (sub-task splitting with persistent progress tracking)
+    m_tools.registerTool(std::make_unique<TodoTool>(m_db, m_sessionMgr, m_providers, m_tools, m_events, m_config,
+                                                    m_permission.get(), [this]() { return workingDirs(); }));
     // Workspace, Sync, Project managers (D2-D4)
     m_workspaces = std::make_unique<WorkspaceManager>(m_db);
     m_sync = std::make_unique<SyncManager>(m_db, m_events);

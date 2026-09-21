@@ -85,6 +85,14 @@ public:
     // Abort a running session
     bool abortSession(const std::string &sessionId);
 
+    // Check whether a cooperative abort has been requested for this session.
+    // The registry is process-global: prompts running on any SessionPrompt
+    // instance (including ephemeral todo_write child instances) observe it.
+    bool isAbortRequested(const std::string &sessionId) const;
+
+    // Clear a pending abort request (called when a new prompt starts)
+    void clearAbortRequest(const std::string &sessionId);
+
     // Check if session is busy
     bool isBusy(const std::string &sessionId) const;
 
@@ -128,6 +136,9 @@ public:
     // If providerId is empty, returns all providers for that date.
     json getTokenUsage(const std::string &date = "",
                        const std::string &providerId = "");
+
+    // Direct database access (for compaction queries)
+    Database &database() { return m_db; }
 
 private:
     void loadSessionsFromDb();

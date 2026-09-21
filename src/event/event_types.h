@@ -47,6 +47,10 @@ namespace EventType {
     constexpr const char *MemoryCreated    = "memory.created";
     constexpr const char *MemoryUpdated    = "memory.updated";
     constexpr const char *MemoryDeleted    = "memory.deleted";
+
+    // Todo events (sub-task tracking)
+    constexpr const char *TodoCreated      = "todo.created";
+    constexpr const char *TodoUpdated      = "todo.updated";
 }
 
 // A single event in the system

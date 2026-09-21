@@ -268,6 +268,7 @@ bool SessionManager::deleteSession(const std::string &id)
         m_db.execute("DELETE FROM session WHERE id = ?", {id});
         m_sessions.erase(id);
         m_status.erase(id);
+        m_abortFlags.erase(id);
         found = true;
         LOG_INFO("Session deleted: " + id);
     }
@@ -286,6 +287,7 @@ bool SessionManager::updateSession(const std::string &id, const json &updates)
 
         auto &s = it->second;
         if (updates.contains("title")) s.title = updates["title"].get<std::string>();
+        if (updates.contains("parent_id")) s.parentId = updates["parent_id"].get<std::string>();
         if (updates.contains("model")) s.model = updates["model"].get<std::string>();
         if (updates.contains("provider_id")) s.providerId = updates["provider_id"].get<std::string>();
         if (updates.contains("agent_id")) s.agentId = updates["agent_id"].get<std::string>();
@@ -405,6 +407,7 @@ std::vector<Message> SessionManager::getMessages(const std::string &sessionId, i
         msg.id = row.value("id", "");
         msg.sessionId = row.value("session_id", "");
         msg.role = stringToRole(row.value("role", "user"));
+        msg.status = row.value("status", "normal");
         msg.timeCreated = row.value("time_created", int64_t(0));
         msg.timeUpdated = row.value("time_updated", int64_t(0));
         std::string dataStr = row.value("data", "{}");
@@ -528,12 +531,24 @@ bool SessionManager::deletePart(const std::string &sessionId, const std::string 
 bool SessionManager::abortSession(const std::string &sessionId)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    // operator[] creates the entry on first use, so a request registered
+    // before the prompt starts (or on behalf of a child session running on
+    // another SessionPrompt instance) is never lost
+    m_abortFlags[sessionId].store(true);
+    return true;
+}
+
+bool SessionManager::isAbortRequested(const std::string &sessionId) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_abortFlags.find(sessionId);
-    if (it != m_abortFlags.end()) {
-        it->second = true;
-        return true;
-    }
-    return false;
+    return it != m_abortFlags.end() && it->second.load();
+}
+
+void SessionManager::clearAbortRequest(const std::string &sessionId)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_abortFlags.erase(sessionId);
 }
 
 bool SessionManager::isBusy(const std::string &sessionId) const
@@ -612,6 +627,7 @@ SessionInfo SessionManager::forkSession(const std::string &sessionId, const std:
             msg.id = row.value("id", "");
             msg.sessionId = row.value("session_id", "");
             msg.role = stringToRole(row.value("role", "user"));
+            msg.status = row.value("status", "normal");
             msg.timeCreated = row.value("time_created", int64_t(0));
             msg.timeUpdated = row.value("time_updated", int64_t(0));
             std::string dataStr = row.value("data", "{}");
@@ -623,6 +639,7 @@ SessionInfo SessionManager::forkSession(const std::string &sessionId, const std:
             newMsg.id = util::uuid4();
             newMsg.sessionId = newSession.id;
             newMsg.role = msg.role;
+            newMsg.status = msg.status;
             newMsg.data = msg.data;
             newMsg.timeCreated = msg.timeCreated;
             newMsg.timeUpdated = msg.timeUpdated;
@@ -856,11 +873,11 @@ void SessionManager::saveMessageToDb(const Message &msg)
     // and the ON DELETE CASCADE from part.message_id would wipe all parts of
     // this message (opencode's storage uses the same update-not-replace semantics).
     bool ok = m_db.execute(
-        "INSERT INTO message (id, session_id, role, data, time_created, time_updated) "
-        "VALUES (?, ?, ?, ?, ?, ?) "
+        "INSERT INTO message (id, session_id, role, status, data, time_created, time_updated) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, role=excluded.role, "
-        "data=excluded.data, time_updated=excluded.time_updated",
-        {msg.id, msg.sessionId, roleToString(msg.role), dataStr,
+        "status=excluded.status, data=excluded.data, time_updated=excluded.time_updated",
+        {msg.id, msg.sessionId, roleToString(msg.role), msg.status, dataStr,
          msg.timeCreated, msg.timeUpdated});
     if (!ok) {
         LOG_ERROR("saveMessageToDb failed for msg " + msg.id);

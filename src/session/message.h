@@ -6,13 +6,14 @@
 using json = nlohmann::json;
 
 // Message role
-enum class MessageRole { User, Assistant, System };
+enum class MessageRole { User, Assistant, System, Compact };
 
 inline std::string roleToString(MessageRole r) {
     switch (r) {
     case MessageRole::User:      return "user";
     case MessageRole::Assistant: return "assistant";
     case MessageRole::System:    return "system";
+    case MessageRole::Compact:   return "compact";
     }
     return "unknown";
 }
@@ -21,6 +22,7 @@ inline MessageRole stringToRole(const std::string &s) {
     if (s == "user") return MessageRole::User;
     if (s == "assistant") return MessageRole::Assistant;
     if (s == "system") return MessageRole::System;
+    if (s == "compact") return MessageRole::Compact;
     return MessageRole::User;
 }
 
@@ -43,6 +45,7 @@ struct Message {
     std::string id;
     std::string sessionId;
     MessageRole role = MessageRole::User;
+    std::string status = "normal";  // "normal" or "compact" (context compaction)
     json data;             // Additional message data (model, agent, tokens, cost, finish reason, etc.)
     std::vector<Part> parts;
     int64_t timeCreated = 0;

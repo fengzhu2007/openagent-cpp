@@ -76,6 +76,7 @@ set(OPENCODE_SOURCES
     src/tool/builtin/task_tool.cpp
     src/tool/builtin/question_tool.cpp
     src/tool/builtin/skill_tool.cpp
+    src/tool/builtin/todo_tool.cpp
     src/tool/builtin/working_dir_tool.cpp
     src/workspace/workspace.cpp
     src/sync/sync.cpp
@@ -139,6 +140,7 @@ set(OPENCODE_HEADERS
     src/tool/builtin/task_tool.h
     src/tool/builtin/question_tool.h
     src/tool/builtin/skill_tool.h
+    src/tool/builtin/todo_tool.h
     src/tool/builtin/working_dir_tool.h
     src/workspace/workspace.h
     src/sync/sync.h

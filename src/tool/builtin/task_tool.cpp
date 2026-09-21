@@ -115,6 +115,8 @@ ToolResult TaskTool::execute(const json &args, const std::string &)
     SessionPrompt childPrompt(m_sessionMgr, m_providers, m_tools, m_events, m_config, m_permission);
     if (m_workingDirsGetter)
         childPrompt.setWorkingDirsGetter(m_workingDirsGetter);
+    // Subagents must not spawn nested todo plans
+    childPrompt.excludeTool("todo_write");
 
     auto startTime = std::chrono::steady_clock::now();
     const int timeoutMinutes = 5;

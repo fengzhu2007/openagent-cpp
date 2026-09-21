@@ -17,6 +17,8 @@ struct ToolResult {
     std::string output;
     std::string error;
     std::string title;  // Short description for UI
+    json metadata;      // Optional structured result persisted in the tool
+                        // part's state.metadata (null = omit)
 };
 
 // Abstract tool interface

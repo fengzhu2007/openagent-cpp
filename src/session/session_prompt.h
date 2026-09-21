@@ -45,6 +45,11 @@ public:
     // Replaces the single-SnapshotManager design for multi-directory support.
     void setSnapshotsGetter(std::function<std::vector<SnapshotManager*>()> getter);
 
+    // Hide a tool from this prompt's LLM tool list and refuse to execute it
+    // (e.g. todo_write in sessions spawned by todo_write/task so sub-tasks
+    // cannot create nested plans). Must be called before prompt().
+    void excludeTool(const std::string &name);
+
     // Run the prompt loop synchronously (blocks until LLM finishes all tool rounds).
     // inputParts is the opencode v1 parts array (text/file); empty means plain text.
     void prompt(const std::string &sessionId, const std::string &userText,
@@ -116,10 +121,14 @@ private:
     ToolResult executeToolCall(const std::string &sessionId, const std::string &sessionDir,
                                const ToolCall &tc);
 
-    // Check context window usage and compact if needed
-    // Returns true if compaction was performed
-    bool checkAndCompact(std::vector<ChatMessage> &chatHistory, Provider *provider,
-                         const std::string &model, const Config::ModelConfig &modelCfg,
+    // Check context window usage and compact if needed.
+    // Loads normal messages from DB, estimates tokens, and if overflow
+    // is detected, summarizes older messages and persists the compact
+    // summary to DB.  The latest user message is never compressed.
+    // Called BEFORE buildChatMessages so the DB is already in a clean
+    // state when the LLM context is assembled.
+    void checkAndCompact(Provider *provider, const std::string &model,
+                         const Config::ModelConfig &modelCfg,
                          const std::string &sessionId);
 
     // Generate a title for the session asynchronously
@@ -152,6 +161,9 @@ private:
     // Callback to get all SnapshotManagers (one per working directory).
     // Replaces the single m_snapshot pointer for multi-directory support.
     std::function<std::vector<SnapshotManager*>()> m_snapshotsGetter;
+
+    // Tool names hidden from the LLM and refused in executeToolCall
+    std::vector<std::string> m_excludedTools;
 
     // Track running prompt threads per session
     mutable std::mutex m_threadsMutex;

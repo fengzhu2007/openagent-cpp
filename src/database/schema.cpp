@@ -178,6 +178,22 @@ void Schema::migrate(Database &db)
         );
     )");
 
+    // Todo item table (sub-task tracking for todo_write tool)
+    db.exec(R"(
+        CREATE TABLE IF NOT EXISTS todo_item (
+            id               TEXT PRIMARY KEY,
+            todo_list_id     TEXT NOT NULL,
+            session_id       TEXT NOT NULL,
+            content          TEXT NOT NULL,
+            status           TEXT NOT NULL DEFAULT 'pending',
+            output           TEXT DEFAULT '',
+            child_session_id TEXT DEFAULT '',
+            sort_order       INTEGER NOT NULL DEFAULT 0,
+            time_created     INTEGER NOT NULL,
+            time_updated     INTEGER NOT NULL
+        );
+    )");
+
     // Indexes
     db.exec("CREATE INDEX IF NOT EXISTS idx_message_session ON message(session_id, time_created);");
     db.exec("CREATE INDEX IF NOT EXISTS idx_part_message ON part(message_id);");
@@ -195,6 +211,8 @@ void Schema::migrate(Database &db)
     db.exec("CREATE INDEX IF NOT EXISTS idx_kg_subject ON knowledge_triple(subject, scope);");
     db.exec("CREATE INDEX IF NOT EXISTS idx_kg_object ON knowledge_triple(object, scope);");
     db.exec("CREATE INDEX IF NOT EXISTS idx_perm_rule_perm ON permission_rule(permission);");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_todo_session ON todo_item(session_id);");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_todo_list ON todo_item(todo_list_id);");
 
     // Migration: add embedding column to existing memory tables (skip if already exists)
     auto cols = db.query("PRAGMA table_info(memory)");
@@ -214,6 +232,16 @@ void Schema::migrate(Database &db)
     }
     if (!hasPreference) {
         db.exec("ALTER TABLE session ADD COLUMN preference TEXT DEFAULT ''");
+    }
+
+    // Migration: add status column to message table (for context compaction)
+    auto msgCols = db.query("PRAGMA table_info(message)");
+    bool hasMsgStatus = false;
+    for (const auto &c : msgCols) {
+        if (c.value("name", "") == "status") { hasMsgStatus = true; break; }
+    }
+    if (!hasMsgStatus) {
+        db.exec("ALTER TABLE message ADD COLUMN status TEXT NOT NULL DEFAULT 'normal'");
     }
 
     LOG_INFO("Database schema migrated.");
