@@ -3,6 +3,7 @@
 #include "util/logger.h"
 #include <algorithm>
 #include <functional>
+#include <set>
 #include <sstream>
 #include <filesystem>
 
@@ -208,6 +209,7 @@ std::vector<SessionInfo> SessionManager::listSessions(int limit, int offset, boo
     // Collect all matching sessions first (unordered_map has no guaranteed order)
     std::vector<SessionInfo> all;
     for (const auto &[id, session] : m_sessions) {
+        if (!session.parentId.empty()) continue;  // skip child sessions
         if (!includeArchived && session.timeArchived > 0) continue;
         all.push_back(session);
     }
@@ -235,6 +237,7 @@ std::vector<SessionInfo> SessionManager::searchSessions(const std::string &query
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
     for (const auto &[id, session] : m_sessions) {
+        if (!session.parentId.empty()) continue;  // skip child sessions
         // Search in title (case-insensitive LIKE %query%)
         std::string lowerTitle = session.title;
         std::transform(lowerTitle.begin(), lowerTitle.end(), lowerTitle.begin(),
@@ -260,17 +263,39 @@ std::vector<SessionInfo> SessionManager::searchSessions(const std::string &query
 
 bool SessionManager::deleteSession(const std::string &id)
 {
+    std::vector<std::string> childIds;
     bool found = false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_sessions.find(id) == m_sessions.end()) return false;
 
+        // Collect child session IDs
+        for (const auto &[sid, session] : m_sessions) {
+            if (session.parentId == id) {
+                childIds.push_back(sid);
+            }
+        }
+
+        // Delete child sessions (CASCADE removes their messages and parts)
+        for (const auto &cid : childIds) {
+            m_db.execute("DELETE FROM session WHERE id = ?", {cid});
+            m_sessions.erase(cid);
+            m_status.erase(cid);
+            m_abortFlags.erase(cid);
+            LOG_INFO("Child session deleted: " + cid);
+        }
+
+        // Delete parent session
         m_db.execute("DELETE FROM session WHERE id = ?", {id});
         m_sessions.erase(id);
         m_status.erase(id);
         m_abortFlags.erase(id);
         found = true;
-        LOG_INFO("Session deleted: " + id);
+        LOG_INFO("Session deleted: " + id + " (children: " + std::to_string(childIds.size()) + ")");
+    }
+    // Publish delete events for children first, then parent
+    for (const auto &cid : childIds) {
+        m_events.publish(EventType::SessionDeleted, {{"sessionID", cid}});
     }
     m_events.publish(EventType::SessionDeleted, {{"sessionID", id}});
     return true;
@@ -388,20 +413,22 @@ Message *SessionManager::getMessage(const std::string &sessionId, const std::str
 
 std::vector<Message> SessionManager::getMessages(const std::string &sessionId, int limit, int64_t beforeTimestamp)
 {
+    // Step 1: Query main session messages only (pagination as before)
     std::vector<std::string> params;
     std::string sql;
     if (beforeTimestamp > 0) {
-        // Older page: messages with time_created < beforeTimestamp, newest first within the limit
         sql = "SELECT * FROM message WHERE session_id = ? AND time_created < ? ORDER BY time_created ASC LIMIT ?";
         params = {sessionId, std::to_string(beforeTimestamp), std::to_string(limit)};
     } else {
-        // First page: get the LATEST messages (subquery picks last N, outer re-sorts ascending)
         sql = "SELECT * FROM (SELECT * FROM message WHERE session_id = ? ORDER BY time_created DESC LIMIT ?) ORDER BY time_created ASC";
         params = {sessionId, std::to_string(limit)};
     }
     auto rows = m_db.query(sql, params);
+    if (rows.empty()) return {};
 
+    // Parse messages and collect message IDs
     std::vector<Message> result;
+    std::vector<std::string> messageIds;
     for (const auto &row : rows) {
         Message msg;
         msg.id = row.value("id", "");
@@ -412,11 +439,142 @@ std::vector<Message> SessionManager::getMessages(const std::string &sessionId, i
         msg.timeUpdated = row.value("time_updated", int64_t(0));
         std::string dataStr = row.value("data", "{}");
         try { msg.data = json::parse(dataStr); } catch (...) { msg.data = json::object(); }
-
-        // Load parts
-        msg.parts = getParts(msg.id);
-        result.push_back(msg);
+        messageIds.push_back(msg.id);
+        result.push_back(std::move(msg));
     }
+
+    // Step 2: Batch query all parts using IN clause (one DB query instead of N)
+    std::string idPlaceholders;
+    for (size_t i = 0; i < messageIds.size(); ++i) {
+        if (i > 0) idPlaceholders += ",?";
+        else idPlaceholders += "?";
+    }
+    auto partRows = m_db.query(
+        "SELECT * FROM part WHERE message_id IN (" + idPlaceholders + ") ORDER BY time_created ASC",
+        messageIds);
+
+    // Group parts by message_id and determine time range
+    std::unordered_map<std::string, std::vector<Part>> partsByMessage;
+    int64_t minTimeCreated = 0;
+    int64_t maxTimeUpdated = 0;
+
+    for (const auto &row : partRows) {
+        Part p;
+        p.id = row.value("id", "");
+        p.messageId = row.value("message_id", "");
+        p.sessionId = row.value("session_id", "");
+        p.type = row.value("type", "");
+        p.timeCreated = row.value("time_created", int64_t(0));
+        p.timeUpdated = row.value("time_updated", int64_t(0));
+        std::string dataStr = row.value("data", "{}");
+        try { p.data = json::parse(dataStr); } catch (...) { p.data = json::object(); }
+
+        if (p.timeCreated > 0 && (minTimeCreated == 0 || p.timeCreated < minTimeCreated))
+            minTimeCreated = p.timeCreated;
+        if (p.timeUpdated > maxTimeUpdated)
+            maxTimeUpdated = p.timeUpdated;
+
+        partsByMessage[p.messageId].push_back(std::move(p));
+    }
+
+    // Assign parts to messages
+    for (auto &msg : result) {
+        auto it = partsByMessage.find(msg.id);
+        if (it != partsByMessage.end()) {
+            msg.parts = std::move(it->second);
+        }
+    }
+
+    // Step 3: Query child session parts within the time range
+    if (minTimeCreated > 0 && maxTimeUpdated > 0) {
+        std::vector<std::string> childIds;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (const auto &[id, session] : m_sessions) {
+                if (session.parentId == sessionId) {
+                    childIds.push_back(id);
+                }
+            }
+        }
+
+        if (!childIds.empty()) {
+            // Build IN clause for child session IDs
+            std::string childPlaceholders;
+            for (size_t i = 0; i < childIds.size(); ++i) {
+                if (i > 0) childPlaceholders += ",?";
+                else childPlaceholders += "?";
+            }
+
+            std::vector<std::string> childParams;
+            for (const auto &id : childIds) childParams.push_back(id);
+            childParams.push_back(std::to_string(minTimeCreated));
+            childParams.push_back(std::to_string(maxTimeUpdated));
+
+            // Step 3a: Query child session assistant message IDs
+            auto childMsgRows = m_db.query(
+                "SELECT id FROM message WHERE session_id IN (" + childPlaceholders + ")"
+                " AND role = 'assistant'"
+                " AND time_created >= ? AND time_created <= ?",
+                childParams);
+
+            if (!childMsgRows.empty()) {
+                // Collect assistant message IDs
+                std::vector<std::string> childMsgIds;
+                for (const auto &mrow : childMsgRows) {
+                    childMsgIds.push_back(mrow.value("id", ""));
+                }
+
+                // Step 3b: Build IN clause for assistant message IDs
+                std::string msgPlaceholders;
+                for (size_t i = 0; i < childMsgIds.size(); ++i) {
+                    if (i > 0) msgPlaceholders += ",?";
+                    else msgPlaceholders += "?";
+                }
+
+                // Query parts of assistant messages only (text and tool types)
+                auto childPartRows = m_db.query(
+                    "SELECT * FROM part WHERE message_id IN (" + msgPlaceholders + ")"
+                    " AND type IN ('text', 'tool')"
+                    " ORDER BY time_created ASC",
+                    childMsgIds);
+
+                // Step 4: Merge child parts into main messages by time
+                std::set<std::string> insertedPartIds;
+                for (const auto &row : childPartRows) {
+                    Part cp;
+                    cp.id = row.value("id", "");
+                    if (insertedPartIds.count(cp.id)) continue;  // skip duplicate
+                    cp.messageId = row.value("message_id", "");
+                    cp.sessionId = row.value("session_id", "");
+                    cp.type = row.value("type", "");
+                    cp.timeCreated = row.value("time_created", int64_t(0));
+                    cp.timeUpdated = row.value("time_updated", int64_t(0));
+                    std::string dataStr = row.value("data", "{}");
+                    try { cp.data = json::parse(dataStr); } catch (...) { cp.data = json::object(); }
+
+                    // Find the message this part belongs to:
+                    // last message where message.timeCreated <= cp.timeCreated
+                    int bestIdx = -1;
+                    for (int i = 0; i < (int)result.size(); ++i) {
+                        if (cp.timeCreated >= result[i].timeCreated) {
+                            bestIdx = i;
+                        }
+                    }
+                    if (bestIdx < 0) continue;
+
+                    // Insert maintaining time order within the message's parts
+                    auto &parts = result[bestIdx].parts;
+                    auto insertPos = parts.begin();
+                    while (insertPos != parts.end() && insertPos->timeCreated < cp.timeCreated) {
+                        ++insertPos;
+                    }
+                    parts.insert(insertPos, std::move(cp));
+                    insertedPartIds.insert(cp.id);
+                }
+            }
+        }
+    }
+
     return result;
 }
 

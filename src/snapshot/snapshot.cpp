@@ -644,6 +644,146 @@ json SnapshotManager::diffFull(const std::string &fromHash, const std::string &t
     return result;
 }
 
+json SnapshotManager::diffFile(const std::string &fromHash, const std::string &toHash, const std::string &filePath) const
+{
+    json result = json::array();
+    if (!m_initialized || filePath.empty()) return result;
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    // Get status for this specific file
+    std::string nameStatus = gitExec(
+        "-c core.quotepath=false diff --no-ext-diff --no-renames --name-status " + fromHash + " " + toHash + " -- \"" + filePath + "\"", true);
+    std::string status = "modified";
+    if (!nameStatus.empty()) {
+        auto tab = nameStatus.find('\t');
+        if (tab != std::string::npos) {
+            std::string code = nameStatus.substr(0, tab);
+            status = code.rfind('A', 0) == 0 ? "added"
+                     : code.rfind('D', 0) == 0 ? "deleted" : "modified";
+        }
+    }
+
+    // Get the unified diff with context (3 lines) for parsing
+    std::string diffOutput = gitExec(
+        "-c core.quotepath=false diff --no-ext-diff --no-renames -U3 " + fromHash + " " + toHash + " -- \"" + filePath + "\"", true);
+    if (diffOutput.find("fatal:") != std::string::npos || diffOutput.find("error:") != std::string::npos) {
+        LOG_ERROR("[diffFile] per-file diff failed for: " + filePath + " - " + diffOutput);
+        diffOutput.clear();
+    }
+
+    // Parse the unified diff into hunks compatible with cvs::DiffContent
+    json hunks = json::array();
+    json currentHunk;
+    int oldLine = 0, newLine = 0;
+    int oldStart = 0, oldCount = 0, newStart = 0, newCount = 0;
+    bool inHunk = false;
+    
+    std::istringstream stream(diffOutput);
+    std::string line;
+    
+    while (std::getline(stream, line)) {
+        // Parse hunk header: @@ -old_start,old_count +new_start,new_count @@
+        if (line.rfind("@@", 0) == 0) {
+            // Save previous hunk if exists
+            if (inHunk && !currentHunk.is_null()) {
+                currentHunk["oldStart"] = oldStart;
+                currentHunk["oldCount"] = oldCount;
+                currentHunk["newStart"] = newStart;
+                currentHunk["newCount"] = newCount;
+                hunks.push_back(currentHunk);
+            }
+            
+            // Parse new hunk header
+            auto plusPos = line.find('+', 3);
+            auto commaPos = line.find(',', plusPos);
+            auto spacePos = line.find(' ', plusPos);
+            if (plusPos != std::string::npos) {
+                std::string newStartStr = line.substr(plusPos + 1, 
+                    (commaPos != std::string::npos ? commaPos : spacePos) - plusPos - 1);
+                newStart = std::atoi(newStartStr.c_str());
+                newLine = newStart;
+                if (commaPos != std::string::npos && spacePos != std::string::npos) {
+                    std::string newCountStr = line.substr(commaPos + 1, spacePos - commaPos - 1);
+                    newCount = std::atoi(newCountStr.c_str());
+                } else {
+                    newCount = 1;
+                }
+            }
+            auto minusPos = line.find('-', 3);
+            auto commaPos2 = line.find(',', minusPos);
+            if (minusPos != std::string::npos) {
+                std::string oldStartStr = line.substr(minusPos + 1,
+                    (commaPos2 != std::string::npos ? commaPos2 : plusPos) - minusPos - 1);
+                oldStart = std::atoi(oldStartStr.c_str());
+                oldLine = oldStart;
+                if (commaPos2 != std::string::npos) {
+                    std::string oldCountStr = line.substr(commaPos2 + 1, plusPos - commaPos2 - 2);
+                    oldCount = std::atoi(oldCountStr.c_str());
+                } else {
+                    oldCount = 1;
+                }
+            }
+            
+            currentHunk = json::object();
+            currentHunk["header"] = line;
+            currentHunk["lines"] = json::array();
+            inHunk = true;
+            continue;
+        }
+        
+        if (!inHunk || line.empty()) continue;
+        
+        // Added line
+        if (line[0] == '+' && line.substr(0, 3) != "+++") {
+            json diffLine;
+            diffLine["type"] = "addition";
+            diffLine["content"] = line;  // Keep the + prefix for DiffEditorWidget
+            diffLine["oldLineNo"] = -1;
+            diffLine["newLineNo"] = newLine;
+            currentHunk["lines"].push_back(diffLine);
+            newLine++;
+        }
+        // Removed line
+        else if (line[0] == '-' && line.substr(0, 3) != "---") {
+            json diffLine;
+            diffLine["type"] = "deletion";
+            diffLine["content"] = line;  // Keep the - prefix for DiffEditorWidget
+            diffLine["oldLineNo"] = oldLine;
+            diffLine["newLineNo"] = -1;
+            currentHunk["lines"].push_back(diffLine);
+            oldLine++;
+        }
+        // Context line
+        else if (line[0] == ' ') {
+            json diffLine;
+            diffLine["type"] = "context";
+            diffLine["content"] = line;  // Keep the space prefix
+            diffLine["oldLineNo"] = oldLine;
+            diffLine["newLineNo"] = newLine;
+            currentHunk["lines"].push_back(diffLine);
+            oldLine++;
+            newLine++;
+        }
+    }
+    
+    // Save last hunk
+    if (inHunk && !currentHunk.is_null()) {
+        currentHunk["oldStart"] = oldStart;
+        currentHunk["oldCount"] = oldCount;
+        currentHunk["newStart"] = newStart;
+        currentHunk["newCount"] = newCount;
+        hunks.push_back(currentHunk);
+    }
+
+    json d;
+    d["file"] = filePath;
+    d["status"] = status;
+    d["hunks"] = hunks;
+    result.push_back(d);
+
+    return result;
+}
+
 std::vector<PatchEntry> SnapshotManager::diffTrees(const std::string &fromHash, const std::string &toHash) const
 {
     std::vector<PatchEntry> entries;
@@ -797,4 +937,13 @@ bool SnapshotManager::revertPatches(const std::vector<SnapshotPatch> &patches)
 
     LOG_INFO("[revertPatches] done, files processed=" + std::to_string(done.size()));
     return true;
+}
+
+std::string SnapshotManager::headCommit() const
+{
+    if (!m_initialized) return "";
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::string head = gitExec("rev-parse --verify --quiet HEAD", true);
+    if (head.empty() || head.find("fatal") != std::string::npos) return "";
+    return head;
 }

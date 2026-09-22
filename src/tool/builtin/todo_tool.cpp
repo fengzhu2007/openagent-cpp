@@ -144,10 +144,10 @@ ToolResult TodoTool::execute(const json &args, const std::string &)
         if (content.empty()) continue;
 
         m_db.execute(
-            "INSERT INTO todo_item (id, todo_list_id, session_id, content, status, output, "
+            "INSERT INTO todo_item (id, task_id, todo_list_id, session_id, content, status, output, "
             "child_session_id, sort_order, time_created, time_updated) "
-            "VALUES (?, ?, ?, ?, 'pending', '', '', ?, ?, ?)",
-            {taskId, todoListId, parentSessionId, content,
+            "VALUES (?, ?, ?, ?, ?, 'pending', '', '', ?, ?, ?)",
+            {util::uuid4(), taskId, todoListId, parentSessionId, content,
              static_cast<int64_t>(i), now, now}
         );
     }
@@ -205,8 +205,8 @@ ToolResult TodoTool::execute(const json &args, const std::string &)
 
         // Update status to running
         m_db.execute(
-            "UPDATE todo_item SET status='running', time_updated=? WHERE id=?",
-            {startTime, taskId}
+            "UPDATE todo_item SET status='running', time_updated=? WHERE task_id=? AND todo_list_id=?",
+            {startTime, taskId, todoListId}
         );
         m_events.publish("todo.updated", {
             {"task_id", taskId}, {"status", "running"}, {"todo_list_id", todoListId},
@@ -222,8 +222,8 @@ ToolResult TodoTool::execute(const json &args, const std::string &)
         if (child.id.empty()) {
             m_db.execute(
                 "UPDATE todo_item SET status='failed', output='Failed to create child session', "
-                "time_updated=? WHERE id=?",
-                {util::nowMs(), taskId}
+                "time_updated=? WHERE task_id=? AND todo_list_id=?",
+                {util::nowMs(), taskId, todoListId}
             );
             m_events.publish("todo.updated", {
                 {"task_id", taskId}, {"status", "failed"}, {"todo_list_id", todoListId},
@@ -237,10 +237,18 @@ ToolResult TodoTool::execute(const json &args, const std::string &)
         // Link child to parent
         m_sessionMgr.updateSession(child.id, {{"parent_id", parentSessionId}});
 
+        // Notify IDE: child session started (so it can route child events to parent page)
+        m_events.publish("subsession.started", json::object({
+            {"sessionID", parentSessionId},
+            {"childSessionID", child.id},
+            {"taskId", taskId},
+            {"todoListId", todoListId}
+        }));
+
         // Record child session ID
         m_db.execute(
-            "UPDATE todo_item SET child_session_id=?, time_updated=? WHERE id=?",
-            {child.id, util::nowMs(), taskId}
+            "UPDATE todo_item SET child_session_id=?, time_updated=? WHERE task_id=? AND todo_list_id=?",
+            {child.id, util::nowMs(), taskId, todoListId}
         );
 
         // Build enhanced prompt with parent context and previous task results
@@ -316,8 +324,8 @@ ToolResult TodoTool::execute(const json &args, const std::string &)
             taskOutput += "\n(interrupted by user abort)";
         }
         m_db.execute(
-            "UPDATE todo_item SET status=?, output=?, time_updated=? WHERE id=?",
-            {finalStatus, taskOutput, util::nowMs(), taskId}
+            "UPDATE todo_item SET status=?, output=?, time_updated=? WHERE task_id=? AND todo_list_id=?",
+            {finalStatus, taskOutput, util::nowMs(), taskId, todoListId}
         );
 
         // Publish completion event

@@ -413,6 +413,10 @@ void Server::setupRoutes()
         handleDiff(req, res);
     });
 
+    m_httpServer.Get(R"(/session/([^/]+)/file/diff)", [this](const httplib::Request &req, httplib::Response &res) {
+        handleFileDiff(req, res);
+    });
+
     // ---- Command routes (B8) ----
     m_httpServer.Post(R"(/session/([^/]+)/command)", [this](const httplib::Request &req, httplib::Response &res) {
         handleExecuteCommand(req, res);
@@ -615,6 +619,9 @@ void Server::setupRoutes()
     });
     m_httpServer.Get("/file/status", [this](const httplib::Request &req, httplib::Response &res) {
         handleFileStatus(req, res);
+    });
+    m_httpServer.Get("/file/diff", [this](const httplib::Request &req, httplib::Response &res) {
+        handleFileDiffGlobal(req, res);
     });
 
     // ---- VCS API ----
@@ -2369,6 +2376,168 @@ void Server::handleDiff(const httplib::Request &req, httplib::Response &res)
     }
     json result = toHash.empty() ? json::array() : owner->diffFull(snapshotHash, toHash);
 
+    middleware::sendJSON(res, result.dump(), 200);
+}
+
+void Server::handleFileDiff(const httplib::Request &req, httplib::Response &res)
+{
+    std::string sessionId = Router::segment(req.path, 2);
+
+    auto *session = m_sessionMgr.getSession(sessionId);
+    if (!session) {
+        middleware::sendError(res, 404, "Session not found: " + sessionId);
+        return;
+    }
+
+    if (!primarySnapshot() || !primarySnapshot()->isInitialized()) {
+        middleware::sendError(res, 503, "Snapshot system not available");
+        return;
+    }
+
+    // Get file path from query param
+    std::string filePath = req.get_param_value("file");
+    if (filePath.empty()) {
+        middleware::sendError(res, 400, "Missing 'file' query parameter");
+        return;
+    }
+
+    // Get the previous HEAD (last snapshot) before tracking current state
+    std::string prevHead = primarySnapshot()->headCommit();
+    if (prevHead.empty()) {
+        middleware::sendJSON(res, json::array().dump(), 200);
+        return;
+    }
+
+    // Track current state (this updates HEAD)
+    std::string currentTree = primarySnapshot()->track();
+    if (currentTree.empty()) {
+        middleware::sendJSON(res, json::array().dump(), 200);
+        return;
+    }
+
+    // Get the new HEAD commit hash
+    std::string newHead = primarySnapshot()->headCommit();
+    if (newHead.empty()) {
+        middleware::sendJSON(res, json::array().dump(), 200);
+        return;
+    }
+
+    // If HEAD didn't change, no diff
+    if (prevHead == newHead) {
+        middleware::sendJSON(res, json::array().dump(), 200);
+        return;
+    }
+
+    // Get diff for the specific file between the two commits
+    json result = primarySnapshot()->diffFile(prevHead, newHead, filePath);
+    middleware::sendJSON(res, result.dump(), 200);
+}
+
+void Server::handleFileDiffGlobal(const httplib::Request &req, httplib::Response &res)
+{
+    // Get absolute file path from query param
+    std::string absPath = req.get_param_value("file");
+    if (absPath.empty()) {
+        middleware::sendError(res, 400, "Missing 'file' query parameter");
+        return;
+    }
+
+    // Check if any session has confirmed changes
+    bool anyConfirmed = false;
+    auto allSessions = m_sessionMgr.listSessions(1000, 0);
+    for (const auto &s : allSessions) {
+        if (s.metadata.value("changesConfirmed", false)) {
+            anyConfirmed = true;
+            break;
+        }
+    }
+    
+    if (anyConfirmed) {
+        // Changes confirmed - return no_changes status
+        json result = json::array();
+        json d;
+        d["file"] = absPath;
+        d["absolutePath"] = absPath;
+        d["status"] = "no_changes";
+        d["message"] = "Changes have been confirmed";
+        d["hunks"] = json::array();
+        result.push_back(d);
+        middleware::sendJSON(res, result.dump(), 200);
+        return;
+    }
+
+    // Normalize path separators to forward slashes
+    std::string normalizedPath = absPath;
+    std::replace(normalizedPath.begin(), normalizedPath.end(), '\\', '/');
+
+    // Find the matching snapshot manager based on worktree
+    SnapshotManager *matchedSnapshot = nullptr;
+    std::string relativePath;
+    
+    for (auto &s : m_snapshots) {
+        if (!s || !s->isInitialized()) continue;
+        std::string wt = s->worktree();
+        std::replace(wt.begin(), wt.end(), '\\', '/');
+        // Ensure worktree ends with /
+        if (!wt.empty() && wt.back() != '/') wt += '/';
+        
+        // Check if the file is within this worktree
+        if (normalizedPath.rfind(wt, 0) == 0) {
+            matchedSnapshot = s.get();
+            relativePath = normalizedPath.substr(wt.length());
+            break;
+        }
+    }
+
+    if (!matchedSnapshot) {
+        // No snapshot found for this file - return empty result with status
+        json result = json::array();
+        json d;
+        d["file"] = normalizedPath;
+        d["absolutePath"] = absPath;
+        d["status"] = "no_snapshot";
+        d["message"] = "File is not tracked by any snapshot repository";
+        d["changes"] = json::array();
+        result.push_back(d);
+        middleware::sendJSON(res, result.dump(), 200);
+        return;
+    }
+
+    // Get the previous HEAD (last snapshot) before tracking current state
+    std::string prevHead = matchedSnapshot->headCommit();
+    if (prevHead.empty()) {
+        middleware::sendJSON(res, json::array().dump(), 200);
+        return;
+    }
+
+    // Track current state (this updates HEAD)
+    std::string currentTree = matchedSnapshot->track();
+    if (currentTree.empty()) {
+        middleware::sendJSON(res, json::array().dump(), 200);
+        return;
+    }
+
+    // Get the new HEAD commit hash
+    std::string newHead = matchedSnapshot->headCommit();
+    if (newHead.empty()) {
+        middleware::sendJSON(res, json::array().dump(), 200);
+        return;
+    }
+
+    // If HEAD didn't change, no diff
+    if (prevHead == newHead) {
+        middleware::sendJSON(res, json::array().dump(), 200);
+        return;
+    }
+
+    // Get diff for the specific file (using relative path)
+    json result = matchedSnapshot->diffFile(prevHead, newHead, relativePath);
+    
+    // Add the original absolute path to the result
+    if (!result.empty() && result[0].is_object()) {
+        result[0]["absolutePath"] = absPath;
+    }
+    
     middleware::sendJSON(res, result.dump(), 200);
 }
 

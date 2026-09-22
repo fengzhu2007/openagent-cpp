@@ -182,6 +182,7 @@ void Schema::migrate(Database &db)
     db.exec(R"(
         CREATE TABLE IF NOT EXISTS todo_item (
             id               TEXT PRIMARY KEY,
+            task_id          TEXT NOT NULL DEFAULT '',
             todo_list_id     TEXT NOT NULL,
             session_id       TEXT NOT NULL,
             content          TEXT NOT NULL,
@@ -242,6 +243,18 @@ void Schema::migrate(Database &db)
     }
     if (!hasMsgStatus) {
         db.exec("ALTER TABLE message ADD COLUMN status TEXT NOT NULL DEFAULT 'normal'");
+    }
+
+    // Migration: add task_id column to todo_item table
+    auto todoCols = db.query("PRAGMA table_info(todo_item)");
+    bool hasTaskId = false;
+    for (const auto &c : todoCols) {
+        if (c.value("name", "") == "task_id") { hasTaskId = true; break; }
+    }
+    if (!hasTaskId) {
+        db.exec("ALTER TABLE todo_item ADD COLUMN task_id TEXT NOT NULL DEFAULT ''");
+        // Populate task_id from existing id values
+        db.exec("UPDATE todo_item SET task_id = id WHERE task_id = ''");
     }
 
     LOG_INFO("Database schema migrated.");

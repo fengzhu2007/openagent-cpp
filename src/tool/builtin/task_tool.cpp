@@ -94,6 +94,13 @@ ToolResult TaskTool::execute(const json &args, const std::string &)
     // Set parent relationship
     m_sessionMgr.updateSession(child.id, {{"parent_id", parentSessionId}});
 
+    // Notify IDE: child session started (so it can route child events to parent page)
+    m_events.publish("subsession.started", json::object({
+        {"sessionID", parentSessionId},
+        {"childSessionID", child.id},
+        {"description", description}
+    }));
+
     LOG_INFO("Task tool: created child session " + child.id + " for task: " + description);
 
     // v1 SubtaskPart: the child's first user message records the sub-task

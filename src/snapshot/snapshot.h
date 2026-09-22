@@ -56,6 +56,9 @@ public:
     // shape: file/patch/additions/deletions/status); used by session.diff
     json diffFull(const std::string &fromHash, const std::string &toHash) const;
 
+    // Compute diff for a single file between two tree hashes
+    json diffFile(const std::string &fromHash, const std::string &toHash, const std::string &filePath) const;
+
     // Restore files to the state captured in a specific tree hash
     bool restore(const std::string &treeHash);
 
@@ -81,6 +84,9 @@ public:
 
     // Get the snapshot repo path
     const std::string &repoPath() const { return m_repoPath; }
+
+    // Get the current HEAD commit hash
+    std::string headCommit() const;
 
     // Delete the bare repo directory from disk, releasing all storage.
     // After cleanup, the manager is reset and can be lazy-initialized again.

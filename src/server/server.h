@@ -97,6 +97,7 @@ private:
     void handleRevert(const httplib::Request &req, httplib::Response &res);
     void handleUnrevert(const httplib::Request &req, httplib::Response &res);
     void handleDiff(const httplib::Request &req, httplib::Response &res);
+    void handleFileDiff(const httplib::Request &req, httplib::Response &res);
 
     // Command routes (B8)
     void handleExecuteCommand(const httplib::Request &req, httplib::Response &res);
@@ -150,6 +151,7 @@ private:
     void handleListFiles(const httplib::Request &req, httplib::Response &res);
     void handleFileContent(const httplib::Request &req, httplib::Response &res);
     void handleFileStatus(const httplib::Request &req, httplib::Response &res);
+    void handleFileDiffGlobal(const httplib::Request &req, httplib::Response &res);
 
     // VCS API
     void handleVcs(const httplib::Request &req, httplib::Response &res);
