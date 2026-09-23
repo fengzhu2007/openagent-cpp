@@ -4,6 +4,7 @@
 #include "server/auth.h"
 #include "util/logger.h"
 #include "util/uuid.h"
+#include "util/utf8.h"
 #include "tool/builtin/shell_tool.h"
 #include "tool/builtin/shell_common.h"
 #include "tool/builtin/skill_tool.h"
@@ -65,62 +66,9 @@ static int subResourceSegIdx(const httplib::Request &req, int oldIdx) {
     return (req.path.rfind("/api/", 0) == 0) ? oldIdx + 1 : oldIdx;
 }
 
-// Convert string to valid UTF-8 (try to convert from local codepage if needed)
+// Convert string to valid UTF-8 (delegates to util::sanitizeUtf8)
 static std::string sanitizeUtf8(const std::string &input) {
-#ifdef _WIN32
-    // First, check if it's already valid UTF-8
-    bool validUtf8 = true;
-    for (size_t i = 0; i < input.size(); ) {
-        unsigned char c = input[i];
-        int bytes = 1;
-        if ((c & 0x80) == 0) bytes = 1;
-        else if ((c & 0xE0) == 0xC0) bytes = 2;
-        else if ((c & 0xF0) == 0xE0) bytes = 3;
-        else if ((c & 0xF8) == 0xF0) bytes = 4;
-        else { validUtf8 = false; break; }
-        if (i + bytes > input.size()) { validUtf8 = false; break; }
-        for (int j = 1; j < bytes; ++j) {
-            if ((input[i+j] & 0xC0) != 0x80) { validUtf8 = false; break; }
-        }
-        if (!validUtf8) break;
-        i += bytes;
-    }
-    if (validUtf8) return input;
-    
-    // Try to convert from local codepage (GBK on Chinese Windows) to UTF-8
-    int wlen = MultiByteToWideChar(CP_ACP, 0, input.c_str(), -1, nullptr, 0);
-    if (wlen > 0) {
-        std::wstring wstr(wlen - 1, L'\0');
-        MultiByteToWideChar(CP_ACP, 0, input.c_str(), -1, &wstr[0], wlen);
-        int utf8len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, nullptr, 0, nullptr, nullptr);
-        if (utf8len > 0) {
-            std::string utf8str(utf8len - 1, '\0');
-            WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &utf8str[0], utf8len, nullptr, nullptr);
-            return utf8str;
-        }
-    }
-#endif
-    // Fallback: replace invalid bytes with replacement character
-    std::string result;
-    result.reserve(input.size());
-    for (size_t i = 0; i < input.size(); ) {
-        unsigned char c = input[i];
-        int bytes = 1;
-        if ((c & 0x80) == 0) bytes = 1;
-        else if ((c & 0xE0) == 0xC0) bytes = 2;
-        else if ((c & 0xF0) == 0xE0) bytes = 3;
-        else if ((c & 0xF8) == 0xF0) bytes = 4;
-        else { result += '\xEF'; result += '\xBF'; result += '\xBD'; ++i; continue; }
-        if (i + bytes > input.size()) { result += '\xEF'; result += '\xBF'; result += '\xBD'; break; }
-        bool valid = true;
-        for (int j = 1; j < bytes; ++j) {
-            if ((input[i+j] & 0xC0) != 0x80) { valid = false; break; }
-        }
-        if (valid) { for (int j = 0; j < bytes; ++j) result += input[i+j]; }
-        else { result += '\xEF'; result += '\xBF'; result += '\xBD'; }
-        i += bytes;
-    }
-    return result;
+    return util::sanitizeUtf8(input);
 }
 
 static int safeStoi(const std::string &str, int defaultVal = 0) {
@@ -166,9 +114,8 @@ Server::Server(const std::string &host, uint16_t port,
     m_sse = std::make_unique<SSEManager>(m_events);
     m_auth = std::make_unique<AuthManager>(m_config);
     m_permission = std::make_unique<PermissionManager>(m_db, m_events);
-    std::string dataDir = m_config.getString("data_dir", ".");
-    std::string worktree = m_config.getString("worktree", ".");
-    m_snapshots.push_back(std::make_unique<SnapshotManager>(dataDir, worktree));
+    // Snapshot managers are created lazily when IDE calls POST /directories
+    // (handleSetWorkingDirs). No initialization at startup.
     m_commands = std::make_unique<CommandManager>(m_config);
     m_commands->loadAll();
     m_agents = std::make_unique<AgentManager>();
@@ -1304,6 +1251,7 @@ void Server::handleSetWorkingDirs(const httplib::Request &req, httplib::Response
             // files_changed for non-git projects (snapshot list stayed empty).
             bool gitRepo = SnapshotManager::isGitRepo(d);
             m_snapshots.push_back(std::make_unique<SnapshotManager>(dataDir, d));
+            m_snapshots.back()->initBaseline();
             LOG_INFO(std::string("[Server] SnapshotManager created for worktree: ") + d +
                      (gitRepo ? "" : " (not a git repo, shadow-repo tracking only)"));
         }
@@ -1443,6 +1391,65 @@ void Server::handleListMessages(const httplib::Request &req, httplib::Response &
     }
 }
 
+Server::ParsedPromptRequest Server::parsePromptRequest(const httplib::Request &req, httplib::Response &res,
+                                                       const std::string &sessionId)
+{
+    ParsedPromptRequest pr;
+
+    json body;
+    if (!middleware::parseJSON(req, body)) {
+        pr.parseError = true;
+        pr.errorMessage = "Invalid JSON body";
+        return pr;
+    }
+
+    pr.text = body.value("text", "");
+    if (pr.text.empty()) {
+        pr.text = body.value("content", "");
+    }
+    // V2 format: {"prompt": {"text": "..."}}
+    if (pr.text.empty() && body.contains("prompt") && body["prompt"].is_object()) {
+        pr.text = body["prompt"].value("text", "");
+    }
+    // opencode v1 format: {"parts": [{"type": "text", ...}, {"type": "file", ...}]}
+    pr.inputParts = json::array();
+    if (body.contains("parts") && body["parts"].is_array()) {
+        for (const auto &part : body["parts"]) {
+            std::string ptype = part.value("type", "");
+            if (ptype == "text") {
+                std::string t = part.value("text", "");
+                if (!t.empty() && pr.text.empty()) pr.text = t;
+            } else if (ptype == "file" && part.contains("url")) {
+                pr.inputParts.push_back(part);
+            } else if (ptype == "agent" && part.contains("name")) {
+                pr.inputParts.push_back(part);
+            } else if (ptype == "subtask" && part.contains("prompt")) {
+                pr.inputParts.push_back(part);
+            }
+        }
+    }
+    if (pr.text.empty() && pr.inputParts.empty()) {
+        pr.parseError = true;
+        pr.errorMessage = "Missing 'text', 'content', 'prompt', or 'parts' in request body";
+        return pr;
+    }
+
+    // Parse model from request and update session if provided
+    if (body.contains("model") && body["model"].is_object()) {
+        std::string reqProviderId = body["model"].value("providerID", "");
+        std::string reqModelId = body["model"].value("modelID", "");
+        if (!reqProviderId.empty() || !reqModelId.empty()) {
+            json updates = json::object();
+            if (!reqProviderId.empty()) updates["provider_id"] = reqProviderId;
+            if (!reqModelId.empty()) updates["model"] = reqModelId;
+            m_sessionMgr.updateSession(sessionId, updates);
+            LOG_INFO("Updated session model: provider=" + reqProviderId + " model=" + reqModelId);
+        }
+    }
+
+    return pr;
+}
+
 void Server::handleSendMessage(const httplib::Request &req, httplib::Response &res)
 {
     std::string sessionId = Router::sessionId(req.path);
@@ -1460,63 +1467,15 @@ void Server::handleSendMessage(const httplib::Request &req, httplib::Response &r
         return;
     }
 
-    json body;
-    if (!middleware::parseJSON(req, body)) {
-        middleware::sendError(res, 400, "Invalid JSON body");
+    auto pr = parsePromptRequest(req, res, sessionId);
+    if (pr.parseError) {
+        middleware::sendError(res, 400, pr.errorMessage);
         return;
-    }
-
-    std::string text = body.value("text", "");
-    if (text.empty()) {
-        // Try "content" field as fallback
-        text = body.value("content", "");
-    }
-    // V2 format: {"prompt": {"text": "..."}}
-    if (text.empty() && body.contains("prompt") && body["prompt"].is_object()) {
-        text = body["prompt"].value("text", "");
-    }
-    // opencode v1 format: {"parts": [{"type": "text", ...}, {"type": "file", ...}]}
-    // Text parts feed the plain-text fallback; the full array (text + file) is
-    // forwarded so the user message records every input part
-    json inputParts = json::array();
-    if (body.contains("parts") && body["parts"].is_array()) {
-        for (const auto &part : body["parts"]) {
-            std::string ptype = part.value("type", "");
-            if (ptype == "text") {
-                std::string t = part.value("text", "");
-                if (!t.empty() && text.empty()) text = t;
-            } else if (ptype == "file" && part.contains("url")) {
-                inputParts.push_back(part);
-            } else if (ptype == "agent" && part.contains("name")) {
-                // v1 AgentPartInput: steering the prompt at a named agent
-                inputParts.push_back(part);
-            } else if (ptype == "subtask" && part.contains("prompt")) {
-                // v1 SubtaskPartInput: sub-agent task marker
-                inputParts.push_back(part);
-            }
-        }
-    }
-    if (text.empty() && inputParts.empty()) {
-        middleware::sendError(res, 400, "Missing 'text', 'content', 'prompt', or 'parts' in request body");
-        return;
-    }
-
-    // Parse model from request and update session if provided
-    if (body.contains("model") && body["model"].is_object()) {
-        std::string reqProviderId = body["model"].value("providerID", "");
-        std::string reqModelId = body["model"].value("modelID", "");
-        if (!reqProviderId.empty() || !reqModelId.empty()) {
-            json updates = json::object();
-            if (!reqProviderId.empty()) updates["provider_id"] = reqProviderId;
-            if (!reqModelId.empty()) updates["model"] = reqModelId;
-            m_sessionMgr.updateSession(sessionId, updates);
-            LOG_INFO("Updated session model: provider=" + reqProviderId + " model=" + reqModelId);
-        }
     }
 
     // Run prompt synchronously (blocks until LLM finishes all tool rounds)
     try {
-        m_prompt->prompt(sessionId, text, inputParts);
+        m_prompt->prompt(sessionId, pr.text, pr.inputParts);
     } catch (const std::exception &e) {
         std::string errMsg = sanitizeUtf8(e.what());
         LOG_ERROR("Prompt error [session=" + sessionId + "]: " + errMsg);
@@ -1563,60 +1522,14 @@ void Server::handlePromptAsync(const httplib::Request &req, httplib::Response &r
         return;
     }
 
-    json body;
-    if (!middleware::parseJSON(req, body)) {
-        middleware::sendError(res, 400, "Invalid JSON body");
+    auto pr = parsePromptRequest(req, res, sessionId);
+    if (pr.parseError) {
+        middleware::sendError(res, 400, pr.errorMessage);
         return;
-    }
-
-    std::string text = body.value("text", "");
-    if (text.empty()) {
-        text = body.value("content", "");
-    }
-    // V2 format: {"prompt": {"text": "...", "files": [...], "agents": [...]}}
-    if (text.empty() && body.contains("prompt") && body["prompt"].is_object()) {
-        text = body["prompt"].value("text", "");
-    }
-    // opencode v1 format: forward the full parts array (text + file) so the
-    // user message records every input part
-    json inputParts = json::array();
-    if (body.contains("parts") && body["parts"].is_array()) {
-        for (const auto &part : body["parts"]) {
-            std::string ptype = part.value("type", "");
-            if (ptype == "text") {
-                std::string t = part.value("text", "");
-                if (!t.empty() && text.empty()) text = t;
-            } else if (ptype == "file" && part.contains("url")) {
-                inputParts.push_back(part);
-            } else if (ptype == "agent" && part.contains("name")) {
-                // v1 AgentPartInput: steering the prompt at a named agent
-                inputParts.push_back(part);
-            } else if (ptype == "subtask" && part.contains("prompt")) {
-                // v1 SubtaskPartInput: sub-agent task marker
-                inputParts.push_back(part);
-            }
-        }
-    }
-    if (text.empty() && inputParts.empty()) {
-        middleware::sendError(res, 400, "Missing 'text', 'content', 'prompt', or 'parts' in request body");
-        return;
-    }
-
-    // Parse model from request and update session if provided
-    if (body.contains("model") && body["model"].is_object()) {
-        std::string reqProviderId = body["model"].value("providerID", "");
-        std::string reqModelId = body["model"].value("modelID", "");
-        if (!reqProviderId.empty() || !reqModelId.empty()) {
-            json updates = json::object();
-            if (!reqProviderId.empty()) updates["provider_id"] = reqProviderId;
-            if (!reqModelId.empty()) updates["model"] = reqModelId;
-            m_sessionMgr.updateSession(sessionId, updates);
-            LOG_INFO("Updated session model: provider=" + reqProviderId + " model=" + reqModelId);
-        }
     }
 
     // Run prompt asynchronously
-    m_prompt->promptAsync(sessionId, text, inputParts);
+    m_prompt->promptAsync(sessionId, pr.text, pr.inputParts);
 
     bool isV2 = (req.path.rfind("/api/", 0) == 0);
     if (isV2) {
@@ -1626,7 +1539,7 @@ void Server::handlePromptAsync(const httplib::Request &req, httplib::Response &r
             {"id", msgId},
             {"sessionID", sessionId},
             {"admittedSeq", 0},
-            {"prompt", json::object({{"text", text}})}
+            {"prompt", json::object({{"text", pr.text}})}
         });
         middleware::sendDataWrapped(res, admitted, 200);
     } else {
@@ -1863,6 +1776,78 @@ void Server::handleUpdatePart(const httplib::Request &req, httplib::Response &re
 
 // ---- Shell Command Handler (B1.4) ----
 
+json Server::executeShellCommandInline(const std::string &sessionId, const SessionInfo *session,
+                                       const std::string &command, const std::string &userContent)
+{
+    m_sessionMgr.setStatus(sessionId, SessionStatus::Busy);
+
+    // Create synthetic user message
+    Message userMsg;
+    userMsg.id = util::uuid4();
+    userMsg.sessionId = sessionId;
+    userMsg.role = MessageRole::User;
+    userMsg.timeCreated = util::nowMs();
+    userMsg.timeUpdated = userMsg.timeCreated;
+    userMsg.data = {{"content", userContent}};
+    m_sessionMgr.addMessage(userMsg);
+
+    // Create assistant message
+    Message assistantMsg = makeAssistantMessage(sessionId, session->model, session->providerId);
+    m_sessionMgr.addMessage(assistantMsg);
+
+    // Create tool part (running state)
+    std::string callID = util::uuid4();
+    Part toolPart;
+    toolPart.id = util::uuid4();
+    toolPart.messageId = assistantMsg.id;
+    toolPart.sessionId = sessionId;
+    toolPart.type = "tool";
+    toolPart.data = json::object({
+        {"callID", callID},
+        {"tool", defaultShellToolName()},
+        {"state", json::object({
+            {"status", "running"},
+            {"input", json::object({{"command", command}})},
+            {"time", json::object({{"start", util::nowMs()}})}
+        })}
+    });
+    toolPart.timeCreated = util::nowMs();
+    toolPart.timeUpdated = toolPart.timeCreated;
+    m_sessionMgr.addPart(toolPart);
+
+    // Execute the shell command
+    Tool *shellTool = m_tools.getTool(defaultShellToolName());
+    ToolResult result;
+    if (shellTool) {
+        try {
+            result = shellTool->execute({{"command", command}}, session->directory);
+        } catch (const std::exception &e) {
+            result.success = false;
+            result.error = std::string("Shell execution error: ") + e.what();
+        }
+    } else {
+        result.success = false;
+        result.error = "Shell tool not registered";
+    }
+
+    // Update tool part state with result
+    std::string status = result.success ? "completed" : "error";
+    toolPart.data["state"] = json::object({
+        {"status", status},
+        {"input", json::object({{"command", command}})},
+        {"output", result.success ? result.output : result.error},
+        {"title", defaultShellToolName()},
+        {"metadata", json::object()},
+        {"time", json::object({{"start", toolPart.timeCreated}, {"end", util::nowMs()}})}
+    });
+    toolPart.timeUpdated = util::nowMs();
+    m_sessionMgr.updatePart(toolPart);
+
+    m_sessionMgr.setStatus(sessionId, SessionStatus::Idle);
+
+    return assistantMsg.toWithPartsJson();
+}
+
 void Server::handleShellCommand(const httplib::Request &req, httplib::Response &res)
 {
     std::string sessionId = Router::segment(req.path, 2);
@@ -1890,78 +1875,8 @@ void Server::handleShellCommand(const httplib::Request &req, httplib::Response &
         return;
     }
 
-    // Set session to busy
-    m_sessionMgr.setStatus(sessionId, SessionStatus::Busy);
-
-    // Create synthetic user message
-    Message userMsg;
-    userMsg.id = util::uuid4();
-    userMsg.sessionId = sessionId;
-    userMsg.role = MessageRole::User;
-    userMsg.timeCreated = util::nowMs();
-    userMsg.timeUpdated = userMsg.timeCreated;
-    userMsg.data = {{"content", "The following tool was executed by the user"}};
-    m_sessionMgr.addMessage(userMsg);
-
-    // Create assistant message
-    Message assistantMsg = makeAssistantMessage(sessionId, session->model, session->providerId);
-    m_sessionMgr.addMessage(assistantMsg);
-
-    // Create tool part (opencode format: type="tool", state-based)
-    std::string callID = util::uuid4();
-    Part toolPart;
-    toolPart.id = util::uuid4();
-    toolPart.messageId = assistantMsg.id;
-    toolPart.sessionId = sessionId;
-    toolPart.type = "tool";
-    toolPart.data = json::object({
-        {"callID", callID},
-        {"tool", defaultShellToolName()},
-        {"state", json::object({
-            {"status", "running"},
-            {"input", json::object({{"command", command}})},
-            {"time", json::object({{"start", util::nowMs()}})}
-        })}
-    });
-    toolPart.timeCreated = util::nowMs();
-    toolPart.timeUpdated = toolPart.timeCreated;
-    m_sessionMgr.addPart(toolPart);
-
-    // Execute the shell command
-    Tool *shellTool = m_tools.getTool(defaultShellToolName());
-    ToolResult result;
-    if (shellTool) {
-        try {
-            // Execute inside the session's working directory (empty when the
-            // session has none — the tool then falls back to the process CWD).
-            result = shellTool->execute({{"command", command}}, session->directory);
-        } catch (const std::exception &e) {
-            result.success = false;
-            result.error = std::string("Shell execution error: ") + e.what();
-        }
-    } else {
-        result.success = false;
-        result.error = "Shell tool not registered";
-    }
-
-    // Update tool part state with result
-    std::string status = result.success ? "completed" : "error";
-    toolPart.data["state"] = json::object({
-        {"status", status},
-        {"input", json::object({{"command", command}})},
-        {"output", result.success ? result.output : result.error},
-        {"title", defaultShellToolName()},
-        {"metadata", json::object()},
-        {"time", json::object({{"start", toolPart.timeCreated}, {"end", util::nowMs()}})}
-    });
-    toolPart.timeUpdated = util::nowMs();
-    m_sessionMgr.updatePart(toolPart);
-
-    // Set session back to idle
-    m_sessionMgr.setStatus(sessionId, SessionStatus::Idle);
-
-    // Return WithParts
-    json response = assistantMsg.toWithPartsJson();
+    auto response = executeShellCommandInline(sessionId, session, command,
+                                              "The following tool was executed by the user");
     middleware::sendJSON(res, response.dump(), 200);
 }
 
@@ -2039,6 +1954,85 @@ void Server::handleForkSession(const httplib::Request &req, httplib::Response &r
 
 // ---- Snapshot/Revert Handlers (B7) ----
 
+Server::RevertResult Server::collectAndRevertPatches(const std::string &sessionId, const std::string &messageId)
+{
+    RevertResult result;
+
+    // Validate target message exists
+    auto messages = m_sessionMgr.getMessages(sessionId, 10000);
+    int targetIdx = -1;
+    for (int i = 0; i < (int)messages.size(); i++) {
+        if (messages[i].id == messageId) { targetIdx = i; break; }
+    }
+    if (targetIdx < 0) {
+        result.errorMessage = "Message not found: " + messageId;
+        return result;
+    }
+    LOG_INFO("[revert] session=" + sessionId + " messageID=" + messageId +
+             " targetIdx=" + std::to_string(targetIdx));
+
+    // Capture current HEAD for each initialized snapshot (the baseline we revert TO)
+    result.originalSnapshots = json::object();
+    for (auto &s : m_snapshots) {
+        if (!s || !s->isInitialized()) continue;
+        std::string h = s->headCommit();
+        if (!h.empty()) {
+            std::string wt = s->worktree();
+            std::replace(wt.begin(), wt.end(), '\\', '/');
+            result.originalSnapshots[wt] = h;
+        }
+    }
+
+    // Capture what's currently different from HEAD (the changes being reverted)
+    result.diffs = json::array();
+    for (auto &s : m_snapshots) {
+        if (!s || !s->isInitialized()) continue;
+        std::string wt = s->worktree();
+        std::replace(wt.begin(), wt.end(), '\\', '/');
+        if (!result.originalSnapshots.contains(wt)) continue;
+
+        auto entries = s->changedFilesFromHead();
+        for (auto &e : entries) {
+            result.diffs.push_back(json::object({
+                {"file", wt + "/" + e.filePath},
+                {"status", e.status}
+            }));
+        }
+    }
+
+    // Revert every snapshot to HEAD: checkout HEAD -- . + clean -fd
+    for (auto &s : m_snapshots) {
+        if (!s || !s->isInitialized()) continue;
+        LOG_INFO("[revert] revertAll: worktree=" + s->worktree());
+        s->revertAll();
+    }
+
+    // Store revert state in session metadata
+    result.revertInfo = json::object({
+        {"messageID", messageId},
+        {"snapshot", result.originalSnapshots},
+        {"diff", result.diffs},
+        {"summary", json::object({
+            {"additions", 0},
+            {"deletions", 0},
+            {"files", (int)result.diffs.size()}
+        })}
+    });
+    m_sessionMgr.updateSession(sessionId, {{"metadata.revert", result.revertInfo}});
+
+    // Publish session.revert event
+    m_events.publish(EventType::SessionRevert, {
+        {"sessionID", sessionId},
+        {"revert", result.revertInfo}
+    });
+
+    LOG_INFO("[revert] COMPLETE session=" + sessionId +
+             " snapshots=" + std::to_string(result.originalSnapshots.size()));
+
+    result.success = true;
+    return result;
+}
+
 void Server::handleRevert(const httplib::Request &req, httplib::Response &res)
 {
     std::string sessionId = Router::segment(req.path, 2);
@@ -2051,7 +2045,6 @@ void Server::handleRevert(const httplib::Request &req, httplib::Response &res)
         middleware::sendError(res, 409, "Session is busy");
         return;
     }
-    // Check if changes have been confirmed (locked in)
     if (session->metadata.value("changesConfirmed", false)) {
         middleware::sendError(res, 403, "Changes have been confirmed and cannot be reverted");
         return;
@@ -2073,168 +2066,23 @@ void Server::handleRevert(const httplib::Request &req, httplib::Response &res)
     }
     LOG_INFO("[revert] session=" + sessionId + " messageID=" + messageId);
 
-    // Get all messages for this session
-    auto messages = m_sessionMgr.getMessages(sessionId, 10000);
-    LOG_INFO("[revert] total messages=" + std::to_string(messages.size()));
-
-    // Find the target message index
-    int targetIdx = -1;
-    for (int i = 0; i < (int)messages.size(); i++) {
-        if (messages[i].id == messageId) { targetIdx = i; break; }
-    }
-    if (targetIdx < 0) {
-        LOG_ERROR("[revert] messageID not found: " + messageId);
-        middleware::sendError(res, 404, "Message not found: " + messageId);
+    auto rr = collectAndRevertPatches(sessionId, messageId);
+    if (!rr.success) {
+        middleware::sendError(res, 404, rr.errorMessage);
         return;
-    }
-    LOG_INFO("[revert] targetIdx=" + std::to_string(targetIdx) + " role=" +
-             (messages[targetIdx].role == MessageRole::User ? "user" : "assistant"));
-
-    // Collect file entries from patch parts of all messages AFTER the target.
-    // New multi-directory patch format: {files: [{file: absPath, hash: treeHash}]}
-    struct FileEntry { std::string file; std::string hash; };
-    std::vector<FileEntry> allEntries;
-    std::set<std::string> seenFiles;
-    for (int i = targetIdx + 1; i < (int)messages.size(); i++) {
-        const auto &msg = messages[i];
-        if (msg.role != MessageRole::Assistant) continue;
-        bool hasSnap = false;
-        for (const auto &part : msg.parts) {
-            if (part.type == "step-start" && part.data.contains("snapshot")) {
-                hasSnap = true; break;
-            }
-        }
-        if (!hasSnap) continue;
-        for (const auto &part : msg.parts) {
-            if (part.type != "patch") continue;
-            if (!part.data.contains("files") || !part.data["files"].is_array()) continue;
-            for (const auto &f : part.data["files"]) {
-                std::string fp = f.value("file", "");
-                std::string fh = f.value("hash", "");
-                if (fp.empty() || fh.empty()) continue;
-                if (seenFiles.insert(fp).second) {
-                    allEntries.push_back({fp, fh});
-                }
-            }
-        }
-    }
-    LOG_INFO("[revert] allEntries count=" + std::to_string(allEntries.size()));
-    for (const auto &e : allEntries) {
-        LOG_INFO("[revert]   entry: file=" + e.file + " hash=" + e.hash);
-    }
-
-    // Group entries by owning SnapshotManager (probed via hasTree)
-    std::map<SnapshotManager*, std::vector<SnapshotPatch>> grouped;
-    std::map<std::string, SnapshotManager*> hashOwner;
-    for (const auto &e : allEntries) {
-        SnapshotManager *owner = nullptr;
-        auto it = hashOwner.find(e.hash);
-        if (it != hashOwner.end()) {
-            owner = it->second;
-        } else {
-            for (auto &s : m_snapshots) {
-                if (s->hasTree(e.hash)) { owner = s.get(); break; }
-            }
-            hashOwner[e.hash] = owner;
-            if (!owner) {
-                LOG_INFO("[revert] hasTree NOT FOUND for hash=" + e.hash +
-                         " file=" + e.file + " (checked " + std::to_string(m_snapshots.size()) + " snapshots)");
-            }
-        }
-        if (!owner) continue;
-        auto &patches = grouped[owner];
-        if (patches.empty() || patches.back().hash != e.hash) {
-            patches.push_back({e.hash, {}});
-        }
-        patches.back().files.push_back(e.file);
-    }
-    LOG_INFO("[revert] grouped managers=" + std::to_string(grouped.size()));
-    for (const auto &[mgr, gp] : grouped) {
-        LOG_INFO("[revert]   manager worktree=" + mgr->worktree() +
-                 " patches=" + std::to_string(gp.size()));
-        for (const auto &p : gp) {
-            LOG_INFO("[revert]     hash=" + p.hash + " files=" + std::to_string(p.files.size()));
-            for (const auto &f : p.files)
-                LOG_INFO("[revert]       file=" + f);
-        }
-    }
-
-    // Save current state of ONLY the affected snapshot managers (those in
-    // grouped). Iterating all m_snapshots would trigger unnecessary git
-    // operations (hasChanges, init, write-tree) on unrelated directories.
-    json originalSnapshots = json::object();
-    for (auto &[mgr, patches] : grouped) {
-        std::string h = mgr->track();
-        LOG_INFO("[revert] track() before revert: worktree=" + mgr->worktree() + " hash=" + h);
-        if (!h.empty()) {
-            std::string wt = mgr->worktree();
-            std::replace(wt.begin(), wt.end(), '\\', '/');
-            originalSnapshots[wt] = h;
-        }
-    }
-
-    // Revert patches via their owning managers
-    for (auto &[mgr, patches] : grouped) {
-        LOG_INFO("[revert] calling revertPatches: worktree=" + mgr->worktree() +
-                 " patchGroups=" + std::to_string(patches.size()));
-        bool ok = mgr->revertPatches(patches);
-        LOG_INFO("[revert] revertPatches returned: " + std::string(ok ? "true" : "false"));
-    }
-
-    // Compute diff for each affected directory after revert
-    json diffs = json::array();
-    for (auto &[mgr, patches] : grouped) {
-        std::string wt = mgr->worktree();
-        std::replace(wt.begin(), wt.end(), '\\', '/');
-        if (!originalSnapshots.contains(wt)) continue;
-        std::string beforeHash = originalSnapshots[wt].get<std::string>();
-        std::string afterHash = mgr->track();
-        if (beforeHash.empty() || afterHash.empty()) continue;
-        auto dirDiffs = mgr->diffFull(beforeHash, afterHash);
-        for (auto &d : dirDiffs) diffs.push_back(d);
     }
 
     // Publish session.diff (v1: shows the changes being backed out)
     m_events.publish(EventType::SessionDiff, {
         {"sessionID", sessionId},
-        {"diff", diffs}
+        {"diff", rr.diffs}
     });
-
-    // Store revert state in session metadata (v1 shape)
-    int64_t additions = 0, deletions = 0;
-    for (const auto &d : diffs) {
-        additions += d.value("additions", 0);
-        deletions += d.value("deletions", 0);
-    }
-    json revertInfo = json::object({
-        {"messageID", messageId},
-        {"snapshot", originalSnapshots},
-        {"diff", diffs},
-        {"summary", json::object({
-            {"additions", additions},
-            {"deletions", deletions},
-            {"files", (int)diffs.size()}
-        })}
-    });
-    m_sessionMgr.updateSession(sessionId, {{"metadata.revert", revertInfo}});
-
-    // Publish session.revert event
-    m_events.publish(EventType::SessionRevert, {
-        {"sessionID", sessionId},
-        {"revert", revertInfo}
-    });
-
-    LOG_INFO("[revert] COMPLETE session=" + sessionId +
-             " files=" + std::to_string(allEntries.size()) +
-             " grouped=" + std::to_string(grouped.size()) +
-             " diffFiles=" + std::to_string(diffs.size()) +
-             " +" + std::to_string(additions) + " -" + std::to_string(deletions));
 
     middleware::sendJSON(res, json::object({
         {"ok", true},
-        {"snapshotHash", originalSnapshots},
-        {"diff", diffs},
-        {"summary", revertInfo["summary"]}
+        {"snapshotHash", rr.originalSnapshots},
+        {"diff", rr.diffs},
+        {"summary", rr.revertInfo["summary"]}
     }).dump(), 200);
 }
 
@@ -2401,35 +2249,8 @@ void Server::handleFileDiff(const httplib::Request &req, httplib::Response &res)
         return;
     }
 
-    // Get the previous HEAD (last snapshot) before tracking current state
-    std::string prevHead = primarySnapshot()->headCommit();
-    if (prevHead.empty()) {
-        middleware::sendJSON(res, json::array().dump(), 200);
-        return;
-    }
-
-    // Track current state (this updates HEAD)
-    std::string currentTree = primarySnapshot()->track();
-    if (currentTree.empty()) {
-        middleware::sendJSON(res, json::array().dump(), 200);
-        return;
-    }
-
-    // Get the new HEAD commit hash
-    std::string newHead = primarySnapshot()->headCommit();
-    if (newHead.empty()) {
-        middleware::sendJSON(res, json::array().dump(), 200);
-        return;
-    }
-
-    // If HEAD didn't change, no diff
-    if (prevHead == newHead) {
-        middleware::sendJSON(res, json::array().dump(), 200);
-        return;
-    }
-
-    // Get diff for the specific file between the two commits
-    json result = primarySnapshot()->diffFile(prevHead, newHead, filePath);
+    // Diff working directory vs HEAD — no track() needed
+    json result = primarySnapshot()->diffFromHead(filePath);
     middleware::sendJSON(res, result.dump(), 200);
 }
 
@@ -2439,30 +2260,6 @@ void Server::handleFileDiffGlobal(const httplib::Request &req, httplib::Response
     std::string absPath = req.get_param_value("file");
     if (absPath.empty()) {
         middleware::sendError(res, 400, "Missing 'file' query parameter");
-        return;
-    }
-
-    // Check if any session has confirmed changes
-    bool anyConfirmed = false;
-    auto allSessions = m_sessionMgr.listSessions(1000, 0);
-    for (const auto &s : allSessions) {
-        if (s.metadata.value("changesConfirmed", false)) {
-            anyConfirmed = true;
-            break;
-        }
-    }
-    
-    if (anyConfirmed) {
-        // Changes confirmed - return no_changes status
-        json result = json::array();
-        json d;
-        d["file"] = absPath;
-        d["absolutePath"] = absPath;
-        d["status"] = "no_changes";
-        d["message"] = "Changes have been confirmed";
-        d["hunks"] = json::array();
-        result.push_back(d);
-        middleware::sendJSON(res, result.dump(), 200);
         return;
     }
 
@@ -2497,41 +2294,14 @@ void Server::handleFileDiffGlobal(const httplib::Request &req, httplib::Response
         d["absolutePath"] = absPath;
         d["status"] = "no_snapshot";
         d["message"] = "File is not tracked by any snapshot repository";
-        d["changes"] = json::array();
+        d["hunks"] = json::array();
         result.push_back(d);
         middleware::sendJSON(res, result.dump(), 200);
         return;
     }
 
-    // Get the previous HEAD (last snapshot) before tracking current state
-    std::string prevHead = matchedSnapshot->headCommit();
-    if (prevHead.empty()) {
-        middleware::sendJSON(res, json::array().dump(), 200);
-        return;
-    }
-
-    // Track current state (this updates HEAD)
-    std::string currentTree = matchedSnapshot->track();
-    if (currentTree.empty()) {
-        middleware::sendJSON(res, json::array().dump(), 200);
-        return;
-    }
-
-    // Get the new HEAD commit hash
-    std::string newHead = matchedSnapshot->headCommit();
-    if (newHead.empty()) {
-        middleware::sendJSON(res, json::array().dump(), 200);
-        return;
-    }
-
-    // If HEAD didn't change, no diff
-    if (prevHead == newHead) {
-        middleware::sendJSON(res, json::array().dump(), 200);
-        return;
-    }
-
-    // Get diff for the specific file (using relative path)
-    json result = matchedSnapshot->diffFile(prevHead, newHead, relativePath);
+    // Diff working directory vs HEAD — no track() needed
+    json result = matchedSnapshot->diffFromHead(relativePath);
     
     // Add the original absolute path to the result
     if (!result.empty() && result[0].is_object()) {
@@ -2582,69 +2352,8 @@ void Server::handleExecuteCommand(const httplib::Request &req, httplib::Response
     // Check if this is a shell inline command
     if (promptText.substr(0, 7) == "!shell:") {
         std::string shellCmd = promptText.substr(7);
-        // Execute as shell command (similar to handleShellCommand)
-        m_sessionMgr.setStatus(sessionId, SessionStatus::Busy);
-
-        Message userMsg;
-        userMsg.id = util::uuid4();
-        userMsg.sessionId = sessionId;
-        userMsg.role = MessageRole::User;
-        userMsg.timeCreated = util::nowMs();
-        userMsg.timeUpdated = userMsg.timeCreated;
-        userMsg.data = {{"content", "Command executed: " + shellCmd}};
-        m_sessionMgr.addMessage(userMsg);
-
-        Message assistantMsg = makeAssistantMessage(sessionId, session->model, session->providerId);
-        m_sessionMgr.addMessage(assistantMsg);
-
-        std::string callID2 = util::uuid4();
-        Part toolPart;
-        toolPart.id = util::uuid4();
-        toolPart.messageId = assistantMsg.id;
-        toolPart.sessionId = sessionId;
-        toolPart.type = "tool";
-        toolPart.data = json::object({
-            {"callID", callID2},
-            {"tool", defaultShellToolName()},
-            {"state", json::object({
-                {"status", "running"},
-                {"input", json::object({{"command", shellCmd}})},
-                {"time", json::object({{"start", util::nowMs()}})}
-            })}
-        });
-        toolPart.timeCreated = util::nowMs();
-        toolPart.timeUpdated = toolPart.timeCreated;
-        m_sessionMgr.addPart(toolPart);
-
-        Tool *shellTool = m_tools.getTool(defaultShellToolName());
-        ToolResult result;
-        if (shellTool) {
-            try {
-                result = shellTool->execute({{"command", shellCmd}}, session->directory);
-            } catch (const std::exception &e) {
-                result.success = false;
-                result.error = std::string("Shell execution error: ") + e.what();
-            }
-        } else {
-            result.success = false;
-            result.error = "Shell tool not registered";
-        }
-
-        std::string status2 = result.success ? "completed" : "error";
-        toolPart.data["state"] = json::object({
-            {"status", status2},
-            {"input", json::object({{"command", shellCmd}})},
-            {"output", result.success ? result.output : result.error},
-            {"title", defaultShellToolName()},
-            {"metadata", json::object()},
-            {"time", json::object({{"start", toolPart.timeCreated}, {"end", util::nowMs()}})}
-        });
-        toolPart.timeUpdated = util::nowMs();
-        m_sessionMgr.updatePart(toolPart);
-
-        m_sessionMgr.setStatus(sessionId, SessionStatus::Idle);
-
-        json response = assistantMsg.toWithPartsJson();
+        auto response = executeShellCommandInline(sessionId, session, shellCmd,
+                                                  "Command executed: " + shellCmd);
         middleware::sendJSON(res, response.dump(), 200);
         return;
     }
@@ -4291,7 +4000,6 @@ void Server::handleRevertStage(const httplib::Request &req, httplib::Response &r
         middleware::sendError(res, 409, "Session is busy");
         return;
     }
-    // Check if changes have been confirmed (locked in)
     if (session->metadata.value("changesConfirmed", false)) {
         middleware::sendError(res, 403, "Changes have been confirmed and cannot be reverted");
         return;
@@ -4311,125 +4019,17 @@ void Server::handleRevertStage(const httplib::Request &req, httplib::Response &r
         return;
     }
 
-    // Collect patches from messages after the target (same logic as handleRevert)
-    auto messages = m_sessionMgr.getMessages(sessionId, 10000);
-    int targetIdx = -1;
-    for (int i = 0; i < (int)messages.size(); i++) {
-        if (messages[i].id == messageId) { targetIdx = i; break; }
-    }
-    if (targetIdx < 0) {
-        middleware::sendError(res, 404, "Message not found: " + messageId);
+    auto rr = collectAndRevertPatches(sessionId, messageId);
+    if (!rr.success) {
+        middleware::sendError(res, 404, rr.errorMessage);
         return;
     }
 
-    struct FileEntry { std::string file; std::string hash; };
-    std::vector<FileEntry> allEntries;
-    std::set<std::string> seenFiles;
-    for (int i = targetIdx + 1; i < (int)messages.size(); i++) {
-        const auto &msg = messages[i];
-        if (msg.role != MessageRole::Assistant) continue;
-        bool hasSnap = false;
-        for (const auto &part : msg.parts) {
-            if (part.type == "step-start" && part.data.contains("snapshot")) {
-                hasSnap = true; break;
-            }
-        }
-        if (!hasSnap) continue;
-        for (const auto &part : msg.parts) {
-            if (part.type != "patch") continue;
-            if (!part.data.contains("files") || !part.data["files"].is_array()) continue;
-            for (const auto &f : part.data["files"]) {
-                std::string fp = f.value("file", "");
-                std::string fh = f.value("hash", "");
-                if (fp.empty() || fh.empty()) continue;
-                if (seenFiles.insert(fp).second) {
-                    allEntries.push_back({fp, fh});
-                }
-            }
-        }
-    }
-
-    // Group entries by owning SnapshotManager
-    std::map<SnapshotManager*, std::vector<SnapshotPatch>> grouped;
-    std::map<std::string, SnapshotManager*> hashOwner;
-    for (const auto &e : allEntries) {
-        SnapshotManager *owner = nullptr;
-        auto it = hashOwner.find(e.hash);
-        if (it != hashOwner.end()) {
-            owner = it->second;
-        } else {
-            for (auto &s : m_snapshots) {
-                if (s->hasTree(e.hash)) { owner = s.get(); break; }
-            }
-            hashOwner[e.hash] = owner;
-        }
-        if (!owner) continue;
-        auto &patches = grouped[owner];
-        if (patches.empty() || patches.back().hash != e.hash) {
-            patches.push_back({e.hash, {}});
-        }
-        patches.back().files.push_back(e.file);
-    }
-
-    // Save current state of ONLY the affected snapshot managers (for undo)
-    json originalSnapshots = json::object();
-    for (auto &[mgr, patches] : grouped) {
-        std::string h = mgr->track();
-        if (!h.empty()) {
-            std::string wt = mgr->worktree();
-            std::replace(wt.begin(), wt.end(), '\\', '/');
-            originalSnapshots[wt] = h;
-        }
-    }
-
-    // Apply the revert (restore files to pre-change state)
-    for (auto &[mgr, patches] : grouped) {
-        mgr->revertPatches(patches);
-    }
-
-    // Compute diff: what changed between original and current (after revert)
-    json diffs = json::array();
-    for (auto &[mgr, patches] : grouped) {
-        std::string wt = mgr->worktree();
-        std::replace(wt.begin(), wt.end(), '\\', '/');
-        if (!originalSnapshots.contains(wt)) continue;
-        std::string beforeHash = originalSnapshots[wt].get<std::string>();
-        std::string afterHash = mgr->track();
-        if (beforeHash.empty() || afterHash.empty()) continue;
-        auto dirDiffs = mgr->diffFull(beforeHash, afterHash);
-        for (auto &d : dirDiffs) diffs.push_back(d);
-    }
-
-    int64_t additions = 0, deletions = 0;
-    for (const auto &d : diffs) {
-        additions += d.value("additions", 0);
-        deletions += d.value("deletions", 0);
-    }
-
-    // Store revert state in session metadata
-    json revertInfo = json::object({
-        {"messageID", messageId},
-        {"snapshot", originalSnapshots},
-        {"diff", diffs},
-        {"summary", json::object({
-            {"additions", additions},
-            {"deletions", deletions},
-            {"files", (int)diffs.size()}
-        })}
-    });
-    m_sessionMgr.updateSession(sessionId, {{"metadata.revert", revertInfo}});
-
-    // Publish session.revert event (v1 staged event)
-    m_events.publish(EventType::SessionRevert, {
-        {"sessionID", sessionId},
-        {"revert", revertInfo}
-    });
-
     middleware::sendJSON(res, json::object({
         {"ok", true},
-        {"snapshot", originalSnapshots},
-        {"diff", diffs},
-        {"summary", revertInfo["summary"]}
+        {"snapshot", rr.originalSnapshots},
+        {"diff", rr.diffs},
+        {"summary", rr.revertInfo["summary"]}
     }).dump(), 200);
 }
 
@@ -4555,15 +4155,26 @@ void Server::handleConfirmChanges(const httplib::Request &req, httplib::Response
         return;
     }
 
-    // Mark changes as confirmed. Once confirmed, revert is blocked until
-    // new changes are made by a subsequent prompt (which resets the flag).
-    m_sessionMgr.updateSession(sessionId, {{"metadata.changesConfirmed", true}});
+    // Confirm = track() all snapshots to commit working directory changes
+    // This advances HEAD to current state, so diff from HEAD becomes empty
+    json tracked = json::array();
+    for (auto &s : m_snapshots) {
+        if (!s || !s->isInitialized()) continue;
+        std::string treeHash = s->track(true);
+        if (!treeHash.empty()) {
+            std::string wt = s->worktree();
+            std::replace(wt.begin(), wt.end(), '\\', '/');
+            tracked.push_back(json::object({{"worktree", wt}, {"hash", treeHash}}));
+        }
+    }
 
-    // Also clear any pending revert state (files are in their current state)
+    // Keep changesConfirmed for revert blocking
+    m_sessionMgr.updateSession(sessionId, {{"metadata.changesConfirmed", true}});
+    // Clear any pending revert state
     m_sessionMgr.updateSession(sessionId, {{"metadata.revert", json(nullptr)}});
 
-    LOG_INFO("Changes confirmed for session " + sessionId);
-    middleware::sendJSON(res, json::object({{"ok", true}}).dump(), 200);
+    LOG_INFO("Changes confirmed for session " + sessionId + ", tracked " + std::to_string(tracked.size()) + " snapshots");
+    middleware::sendJSON(res, json::object({{"ok", true}, {"tracked", tracked}}).dump(), 200);
 }
 
 void Server::handleSessionContext(const httplib::Request &req, httplib::Response &res)

@@ -286,6 +286,34 @@ private:
     SnapshotManager *snapshotFor(const std::string &absPath);
     SnapshotManager *primarySnapshot();
 
+    // Parsed prompt request body (shared by handleSendMessage and handlePromptAsync)
+    struct ParsedPromptRequest {
+        std::string text;
+        json inputParts;
+        bool parseError = false;
+        std::string errorMessage;
+    };
+    ParsedPromptRequest parsePromptRequest(const httplib::Request &req, httplib::Response &res,
+                                           const std::string &sessionId);
+
+    // Shared revert logic: capture diff from HEAD, then revertAll() every
+    // initialized SnapshotManager back to HEAD baseline.
+    // Returns false and sets errorMessage on failure.
+    struct RevertResult {
+        json originalSnapshots;
+        json diffs;
+        json revertInfo;
+        bool success = false;
+        std::string errorMessage;
+    };
+    RevertResult collectAndRevertPatches(const std::string &sessionId, const std::string &messageId);
+
+    // Execute a shell command inline (create user/assistant messages, tool part,
+    // run the command, update part state). Shared by handleShellCommand and
+    // handleExecuteCommand's !shell: branch.
+    json executeShellCommandInline(const std::string &sessionId, const SessionInfo *session,
+                                   const std::string &command, const std::string &userContent);
+
     // Snapshot cleanup: delete bare repos from disk.
     void cleanupAllSnapshots();
     bool isWorktreeReferenced(const std::string &worktree, const std::string &excludeSessionId = "");

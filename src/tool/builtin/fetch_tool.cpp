@@ -1,5 +1,6 @@
 #include "tool/builtin/fetch_tool.h"
 #include "util/httplib_client.h"
+#include "util/utf8.h"
 #include <curl/curl.h>
 #include <cctype>
 #include <string>
@@ -29,31 +30,14 @@ std::string trimStr(const std::string &s)
     return s.substr(b, e - b + 1);
 }
 
-bool isValidUtf8(const std::string &s)
-{
-    for (size_t i = 0; i < s.size(); ) {
-        unsigned char c = static_cast<unsigned char>(s[i]);
-        int bytes = 1;
-        if ((c & 0x80) == 0) bytes = 1;
-        else if ((c & 0xE0) == 0xC0) bytes = 2;
-        else if ((c & 0xF0) == 0xE0) bytes = 3;
-        else if ((c & 0xF8) == 0xF0) bytes = 4;
-        else return false;
-        if (i + bytes > s.size()) return false;
-        for (int k = 1; k < bytes; ++k) {
-            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) return false;
-        }
-        i += bytes;
-    }
-    return true;
-}
+// (isValidUtf8 moved to util/utf8.h)
 
 // Convert non-UTF-8 page bytes to UTF-8 using the declared charset. Windows
 // maps charsets to codepages; other platforms pass through unchanged.
 std::string toUtf8(const std::string &input, const std::string &charset)
 {
     if (input.empty()) return input;
-    if (isValidUtf8(input)) return input;  // also covers misdeclared pages
+    if (util::isValidUtf8(input)) return input;  // also covers misdeclared pages
     if (charset.empty() || charset == "utf-8" || charset == "utf8") return input;
 #ifdef _WIN32
     UINT cp = CP_ACP;

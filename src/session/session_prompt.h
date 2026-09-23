@@ -83,13 +83,11 @@ private:
                              const json &startSnapshot,
                              Part &stepFinishPart, bool stepFinishCreated);
 
-    // Compare the prompt-start snapshot with the current file state and
-    // publish a session.files_changed event listing every added / modified /
+    // Compare current working directory with HEAD and publish a
+    // session.files_changed event listing every added / modified /
     // deleted file.  Called once when the prompt loop exits so the IDE can
     // refresh its editors without monitoring the entire filesystem.
-    // promptStartHashes is a JSON object {worktree: hash} for multi-directory.
-    void publishFilesChanged(const std::string &sessionId,
-                             const json &promptStartHashes);
+    void publishFilesChanged(const std::string &sessionId);
 
     // Build chat messages from session history for the provider
     std::vector<ChatMessage> buildChatMessages(const std::string &sessionId);
@@ -107,6 +105,12 @@ private:
                          const Config::ModelConfig &modelCfg,
                          std::vector<ChatMessage> &chatHistory,
                          json &promptStartHashes);
+
+    // Extract token counts from usage JSON, calculate cost, update roundResult.
+    // Returns the calculated cost. Shared by StepFinish and Usage event handlers.
+    double processUsageEvent(const json &usage, const std::string &model,
+                             const Config::ModelConfig &modelCfg,
+                             RoundResult &roundResult);
 
     // Capture a baseline only for worktrees targeted by potentially mutating
     // tool calls. Reuses one baseline for all writes in the same step.

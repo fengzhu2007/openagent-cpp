@@ -852,45 +852,22 @@ void SessionPrompt::prepareToolSnapshots(const std::string &sessionId,
                                          json &promptStartHashes,
                                          Part &stepStartPart)
 {
+    // Capture the current HEAD hash for each worktree before tools run.
+    // This is needed by recordStepEndState to create patch parts for revert.
+    // We do NOT call track() here — HEAD is the baseline, only advanced by confirm.
     auto allSnapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
     auto snapshots = snapshotsForSession(allSnapshots, *m_sessionMgr.getSession(sessionId));
-    if (snapshots.empty()) return;
-
-    for (const auto &toolCall : toolCalls) {
-        if (!isSnapshotWriteTool(toolCall.name)) continue;
-
-        std::string toolCwd = sessionDir;
-        if ((toolCwd.empty() || toolCwd == ".") && m_workingDirsGetter) {
-            auto dirs = m_workingDirsGetter();
-            if (!dirs.empty()) toolCwd = dirs[0];
+    
+    for (auto *sm : snapshots) {
+        if (!sm || !sm->isInitialized()) continue;
+        std::string wt = sm->worktree();
+        std::replace(wt.begin(), wt.end(), '\\', '/');
+        std::string h = sm->headCommit();
+        if (!h.empty()) {
+            stepStartHashes[wt] = h;
+            LOG_INFO("[prepareToolSnapshots] captured HEAD for worktree=" + wt + " hash=" + h);
         }
-        if (toolCwd.empty()) continue;
-
-        std::string target = toolCwd;
-        if ((toolCall.name == "write" || toolCall.name == "edit") &&
-            toolCall.arguments.is_object() && toolCall.arguments.contains("path") &&
-            toolCall.arguments["path"].is_string()) {
-            target = resolvePath(toolCwd, toolCall.arguments["path"].get<std::string>());
-        }
-
-        SnapshotManager *snapshot = snapshotForPath(snapshots, target);
-        if (!snapshot) continue;
-        std::string worktree = snapshot->worktree();
-        std::replace(worktree.begin(), worktree.end(), '\\', '/');
-        if (stepStartHashes.contains(worktree)) continue;
-
-        LOG_INFO("[snapshot] preparing baseline for " + worktree + " before tool: " + toolCall.name);
-        std::string hash = snapshot->track(true);
-        if (hash.empty()) continue;
-
-        stepStartHashes[worktree] = hash;
-        if (!promptStartHashes.contains(worktree)) promptStartHashes[worktree] = hash;
     }
-
-    if (stepStartHashes.empty()) return;
-    stepStartPart.data["snapshot"] = stepStartHashes;
-    stepStartPart.timeUpdated = util::nowMs();
-    m_sessionMgr.updatePart(stepStartPart);
 }
 
 void SessionPrompt::checkAndCompact(Provider *provider, const std::string &model,
@@ -1246,6 +1223,45 @@ void SessionPrompt::triggerMemoryExtraction(
         }
     });
     t.detach();
+}
+
+double SessionPrompt::processUsageEvent(const json &usage, const std::string &model,
+                                        const Config::ModelConfig &modelCfg,
+                                        RoundResult &roundResult)
+{
+    int64_t inputT = usage.value("prompt_tokens", 0);
+    int64_t outputT = usage.value("completion_tokens", 0);
+    int64_t cacheR = usage.value("cache_read_input_tokens", 0);
+    int64_t cacheW = usage.value("cache_creation_input_tokens", 0);
+    int64_t reasoningT = usage.value("reasoning_tokens", 0);
+
+    // Calculate cost: prefer config pricing, fallback to hardcoded table
+    double cost = 0.0;
+    if (modelCfg.costInput > 0 || modelCfg.costOutput > 0) {
+        cost += (static_cast<double>(inputT) / 1000000.0) * modelCfg.costInput;
+        cost += (static_cast<double>(outputT) / 1000000.0) * modelCfg.costOutput;
+        cost += (static_cast<double>(cacheR) / 1000000.0) * modelCfg.costCacheRead;
+        cost += (static_cast<double>(cacheW) / 1000000.0) * modelCfg.costCacheWrite;
+        cost += (static_cast<double>(reasoningT) / 1000000.0) * modelCfg.costOutput;
+    } else {
+        cost = CostCalculator::calculateCost(model, inputT, outputT, cacheR, cacheW, reasoningT);
+    }
+
+    roundResult.inputTokens = inputT;
+    roundResult.outputTokens = outputT;
+    roundResult.cacheReadTokens = cacheR;
+    roundResult.cacheWriteTokens = cacheW;
+    roundResult.reasoningTokens = reasoningT;
+    roundResult.cost = cost;
+
+    LOG_INFO("[processLLMRound] usage: input=" + std::to_string(inputT)
+             + " output=" + std::to_string(outputT)
+             + " cache_read=" + std::to_string(cacheR)
+             + " cache_write=" + std::to_string(cacheW)
+             + " reasoning=" + std::to_string(reasoningT)
+             + " cost=" + std::to_string(cost));
+
+    return cost;
 }
 
 RoundResult SessionPrompt::processLLMRound(const std::string &sessionId, const std::string &sessionDir,
@@ -1653,52 +1669,20 @@ RoundResult SessionPrompt::processLLMRound(const std::string &sessionId, const s
 
                 // Track real token usage from provider response
                 if (!event.usage.is_null() && event.usage.is_object()) {
-                    int64_t inputT = event.usage.value("prompt_tokens", 0);
-                    int64_t outputT = event.usage.value("completion_tokens", 0);
-                    int64_t cacheR = event.usage.value("cache_read_input_tokens", 0);
-                    int64_t cacheW = event.usage.value("cache_creation_input_tokens", 0);
-                    int64_t reasoningT = event.usage.value("reasoning_tokens", 0);
+                    double cost = processUsageEvent(event.usage, model, modelCfg, roundResult);
 
                     stepPart.data["tokens"] = json::object({
-                        {"input", inputT},
-                        {"output", outputT},
-                        {"reasoning", reasoningT},
-                        {"cache_read", cacheR},
-                        {"cache_write", cacheW}
+                        {"input", roundResult.inputTokens},
+                        {"output", roundResult.outputTokens},
+                        {"reasoning", roundResult.reasoningTokens},
+                        {"cache_read", roundResult.cacheReadTokens},
+                        {"cache_write", roundResult.cacheWriteTokens}
                     });
-
-                    // Calculate cost: prefer config pricing, fallback to hardcoded table
-                    double cost = 0.0;
-                    if (modelCfg.costInput > 0 || modelCfg.costOutput > 0) {
-                        // Use config-based pricing (per 1M tokens)
-                        cost += (static_cast<double>(inputT) / 1000000.0) * modelCfg.costInput;
-                        cost += (static_cast<double>(outputT) / 1000000.0) * modelCfg.costOutput;
-                        cost += (static_cast<double>(cacheR) / 1000000.0) * modelCfg.costCacheRead;
-                        cost += (static_cast<double>(cacheW) / 1000000.0) * modelCfg.costCacheWrite;
-                        cost += (static_cast<double>(reasoningT) / 1000000.0) * modelCfg.costOutput;
-                    } else {
-                        cost = CostCalculator::calculateCost(model, inputT, outputT, cacheR, cacheW, reasoningT);
-                    }
                     stepPart.data["cost"] = cost;
 
                     // Update assistant message token data
                     assistantMsg.data["tokens"] = stepPart.data["tokens"];
                     assistantMsg.data["cost"] = cost;
-
-                    // Store in round result for session-level accumulation
-                    roundResult.inputTokens = inputT;
-                    roundResult.outputTokens = outputT;
-                    roundResult.cacheReadTokens = cacheR;
-                    roundResult.cacheWriteTokens = cacheW;
-                    roundResult.reasoningTokens = reasoningT;
-                    roundResult.cost = cost;
-
-                    LOG_INFO("[processLLMRound] usage: input=" + std::to_string(inputT)
-                             + " output=" + std::to_string(outputT)
-                             + " cache_read=" + std::to_string(cacheR)
-                             + " cache_write=" + std::to_string(cacheW)
-                             + " reasoning=" + std::to_string(reasoningT)
-                             + " cost=" + std::to_string(cost));
                 }
 
                 stepPart.timeCreated = util::nowMs();
@@ -1727,38 +1711,16 @@ RoundResult SessionPrompt::processLLMRound(const std::string &sessionId, const s
             {
                 // Delayed usage report: arrived after StepFinish (separate chunk)
                 if (!event.usage.is_null() && event.usage.is_object()) {
-                    int64_t inputT = event.usage.value("prompt_tokens", 0);
-                    int64_t outputT = event.usage.value("completion_tokens", 0);
-                    int64_t cacheR = event.usage.value("cache_read_input_tokens", 0);
-                    int64_t cacheW = event.usage.value("cache_creation_input_tokens", 0);
-                    int64_t reasoningT = event.usage.value("reasoning_tokens", 0);
-
                     // Only update if StepFinish didn't already capture usage
                     if (roundResult.inputTokens == 0 && roundResult.outputTokens == 0) {
-                        roundResult.inputTokens = inputT;
-                        roundResult.outputTokens = outputT;
-                        roundResult.cacheReadTokens = cacheR;
-                        roundResult.cacheWriteTokens = cacheW;
-                        roundResult.reasoningTokens = reasoningT;
-
-                        double cost = 0.0;
-                        if (modelCfg.costInput > 0 || modelCfg.costOutput > 0) {
-                            cost += (static_cast<double>(inputT) / 1000000.0) * modelCfg.costInput;
-                            cost += (static_cast<double>(outputT) / 1000000.0) * modelCfg.costOutput;
-                            cost += (static_cast<double>(cacheR) / 1000000.0) * modelCfg.costCacheRead;
-                            cost += (static_cast<double>(cacheW) / 1000000.0) * modelCfg.costCacheWrite;
-                            cost += (static_cast<double>(reasoningT) / 1000000.0) * modelCfg.costOutput;
-                        } else {
-                            cost = CostCalculator::calculateCost(model, inputT, outputT, cacheR, cacheW, reasoningT);
-                        }
-                        roundResult.cost = cost;
+                        double cost = processUsageEvent(event.usage, model, modelCfg, roundResult);
 
                         // Update step-finish part and assistant message with delayed usage
                         if (stepFinishCreated) {
                             lastStepFinishPart.data["tokens"] = json::object({
-                                {"input", inputT}, {"output", outputT},
-                                {"reasoning", reasoningT},
-                                {"cache_read", cacheR}, {"cache_write", cacheW}
+                                {"input", roundResult.inputTokens}, {"output", roundResult.outputTokens},
+                                {"reasoning", roundResult.reasoningTokens},
+                                {"cache_read", roundResult.cacheReadTokens}, {"cache_write", roundResult.cacheWriteTokens}
                             });
                             lastStepFinishPart.data["cost"] = cost;
                             lastStepFinishPart.timeUpdated = util::nowMs();
@@ -1767,9 +1729,7 @@ RoundResult SessionPrompt::processLLMRound(const std::string &sessionId, const s
                         assistantMsg.data["tokens"] = lastStepFinishPart.data["tokens"];
                         assistantMsg.data["cost"] = cost;
 
-                        LOG_INFO("[processLLMRound] delayed usage: input=" + std::to_string(inputT)
-                                 + " output=" + std::to_string(outputT)
-                                 + " cost=" + std::to_string(cost));
+                        LOG_INFO("[processLLMRound] delayed usage: cost=" + std::to_string(cost));
                     }
                 }
             }
@@ -2021,13 +1981,16 @@ void SessionPrompt::recordStepEndState(const std::string &sessionId, const std::
 
     // Only worktrees whose potentially writing tools captured a baseline need
     // an end-of-step snapshot. Uninvolved projects perform no Git operations.
+    // We use stageAndWriteTree() instead of track() to capture the current
+    // tree state WITHOUT committing — HEAD must stay at the baseline so that
+    // changedFilesFromHead() and revertAll() work correctly.
     json completedMulti = json::object();
     for (auto *sm : snapshots) {
         if (!sm || !sm->isInitialized()) continue;
         std::string wt = sm->worktree();
         std::replace(wt.begin(), wt.end(), '\\', '/');
         if (!startSnapshot.contains(wt)) continue;
-        std::string h = sm->track();
+        std::string h = sm->stageAndWriteTree();
         if (!h.empty()) completedMulti[wt] = h;
     }
     if (!completedMulti.empty() && stepFinishCreated &&
@@ -2072,50 +2035,34 @@ void SessionPrompt::recordStepEndState(const std::string &sessionId, const std::
     m_sessionMgr.addPart(patchPart);
 }
 
-void SessionPrompt::publishFilesChanged(const std::string &sessionId,
-                                         const json &promptStartHashes)
+void SessionPrompt::publishFilesChanged(const std::string &sessionId)
 {
     auto allSnapshots = m_snapshotsGetter ? m_snapshotsGetter() : std::vector<SnapshotManager*>{};
     auto snapshots = snapshotsForSession(allSnapshots, *m_sessionMgr.getSession(sessionId));
-    if (snapshots.empty() || promptStartHashes.empty() || !promptStartHashes.is_object())
-        return;
+    if (snapshots.empty()) return;
 
-    // For each directory, patch() stages current working-tree changes, writes
-    // a tree, and diffs it against the prompt-start tree — returning one
-    // PatchEntry per changed file with its status (added / modified / deleted).
+    // For each snapshot, get changed files (working directory vs HEAD)
+    // and compute per-file diffs.
     json filesArr = json::array();
     json diffArr = json::array();
     for (auto *sm : snapshots) {
         if (!sm || !sm->isInitialized()) continue;
         std::string wt = sm->worktree();
         std::replace(wt.begin(), wt.end(), '\\', '/');
-        if (!promptStartHashes.contains(wt)) continue;
-        std::string startHash = promptStartHashes[wt].get<std::string>();
-        if (startHash.empty()) continue;
+        if (!wt.empty() && wt.back() != '/') wt += '/';
 
-        // Stage the current working state FIRST: the index is only updated
-        // by track(), and changes from the final tool round never went
-        // through prepareToolSnapshots. patch()'s write-tree below would
-        // otherwise serialize a stale index and miss them (a file created
-        // in the last tool round would never be reported as "added").
-        std::string currentHash = sm->track();
-
-        auto entries = sm->patch(startHash);
+        auto entries = sm->changedFilesFromHead();
         for (const auto &e : entries) {
-            std::string abs = wt + "/" + e.filePath;
+            std::string abs = wt + e.filePath;
             std::replace(abs.begin(), abs.end(), '\\', '/');
             filesArr.push_back(json::object({
                 {"path", abs},
                 {"status", e.status}   // "added", "modified", "deleted"
             }));
-        }
 
-        // Compute full diff (with additions/deletions/patch) for the IDE
-        // file-change popup. diffFull compares currentHash (written by
-        // track() above) against the prompt-start tree.
-        if (!currentHash.empty()) {
-            auto fullDiffs = sm->diffFull(startHash, currentHash);
-            for (auto &d : fullDiffs) diffArr.push_back(d);
+            // Compute per-file diff (working directory vs HEAD)
+            auto fileDiff = sm->diffFromHead(e.filePath);
+            for (auto &d : fileDiff) diffArr.push_back(d);
         }
     }
     if (filesArr.empty()) return;
@@ -2319,7 +2266,7 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
             // errors instead of hanging in the transcript forever
             finalizeInterruptedToolParts(sessionId, assistantMsg.id);
             // Notify IDE about files changed so far (even on abort)
-            publishFilesChanged(sessionId, promptStartHashes);
+            publishFilesChanged(sessionId);
             m_sessionMgr.setStatus(sessionId, SessionStatus::Idle);
             return;
         }
@@ -2408,7 +2355,7 @@ void SessionPrompt::runPrompt(const std::string &sessionId, const std::string &u
     }
 
     // Notify IDE which files this conversation turn changed
-    publishFilesChanged(sessionId, promptStartHashes);
+    publishFilesChanged(sessionId);
 
     // Set session back to idle
     m_sessionMgr.setStatus(sessionId, SessionStatus::Idle);

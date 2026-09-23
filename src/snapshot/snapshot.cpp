@@ -49,8 +49,26 @@ SnapshotManager::SnapshotManager(const std::string &dataDir, const std::string &
 
 bool SnapshotManager::isGitAvailable() const
 {
-    std::string result = gitExec("--version", false);
-    return result.find("git version") != std::string::npos;
+    // Cache the result: git availability is process-global.
+    // Cannot call gitExec() here (non-static member); just run git directly.
+    static const bool cached = []() {
+#ifdef _WIN32
+        FILE *pipe = _popen("git --version 2>&1", "r");
+#else
+        FILE *pipe = popen("git --version 2>&1", "r");
+#endif
+        if (!pipe) return false;
+        char buf[128];
+        std::string output;
+        while (fgets(buf, sizeof(buf), pipe)) output += buf;
+#ifdef _WIN32
+        _pclose(pipe);
+#else
+        pclose(pipe);
+#endif
+        return output.find("git version") != std::string::npos;
+    }();
+    return cached;
 }
 
 bool SnapshotManager::isGitRepo(const std::string &dir)
@@ -240,22 +258,33 @@ bool SnapshotManager::initRepoLocked()
     std::string headPath = m_repoPath + PATH_SEP + "HEAD";
     std::ifstream check(headPath);
     if (check.good()) {
-        // Repo exists — ensure core.worktree is set (may be missing from
-        // older repos created before the fix).
+        // Repo exists — ensure core.worktree and core.bare are correct.
+        // Older repos were created with git init --bare (core.bare=true),
+        // which prevents git status from scanning untracked files.
         gitExecBool("--git-dir \"" + m_repoPath + "\" config core.worktree \"" + m_worktree + "\"", false);
+        gitExecBool("--git-dir \"" + m_repoPath + "\" config core.bare false", false);
         writeExcludePatterns();
         return true;
     }
 
-    // Initialize bare git repo
-    if (!gitExecBool("init --bare \"" + m_repoPath + "\"")) {
+    // Initialize non-bare git repo (core.bare=false by default).
+    // This allows git status to properly scan the worktree for untracked files.
+    if (!gitExecBool("init \"" + m_repoPath + "\"")) {
         LOG_ERROR("Failed to init snapshot repo at: " + m_repoPath);
         return false;
     }
 
-    // Configure the repo to allow working on files outside
-    // Must use --git-dir to target the bare repo we just created,
-    // since the current working directory is not inside it.
+    // git init creates a .git subdirectory; move its contents up to m_repoPath
+    // so the structure is flat (HEAD, objects/, refs/ directly in m_repoPath).
+    std::string gitSubDir = m_repoPath + PATH_SEP + ".git";
+    std::error_code ec;
+    for (auto &entry : fs::directory_iterator(gitSubDir, ec)) {
+        std::string dest = m_repoPath + PATH_SEP + entry.path().filename().string();
+        fs::rename(entry.path(), dest, ec);
+    }
+    fs::remove(gitSubDir, ec);
+
+    // Configure the repo to use the project directory as worktree
     gitExecBool("--git-dir \"" + m_repoPath + "\" config core.worktree \"" + m_worktree + "\"", false);
 
     // Write exclude patterns to skip large directories during git add -A
@@ -266,7 +295,7 @@ bool SnapshotManager::initRepoLocked()
 
 void SnapshotManager::writeExcludePatterns()
 {
-    // Write .git/info/exclude (bare repo: info/exclude) to skip common
+    // Write .git/info/exclude (shadow repo: info/exclude) to skip common
     // large directories that should never be tracked in snapshots.
     // This prevents git add -A from scanning hundreds of thousands of files.
     std::string infoDir = m_repoPath + PATH_SEP + "info";
@@ -383,13 +412,48 @@ bool SnapshotManager::gitExecBool(const std::string &args, bool inWorktree) cons
            result.find("error:") == std::string::npos;
 }
 
+std::string SnapshotManager::worktreeGitExec(const std::string &args) const
+{
+    if (m_worktree.empty()) return "";
+#ifdef _WIN32
+    std::string cmd = "cd /d \"" + m_worktree + "\" && git " + args + " 2>&1";
+#else
+    std::string cmd = "cd \"" + m_worktree + "\" && git " + args + " 2>&1";
+#endif
+    std::array<char, 4096> buffer;
+    std::string result;
+#ifdef _WIN32
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) return "";
+    std::wstring wCmd(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, &wCmd[0], wlen);
+    FILE *pipe = _wpopen(wCmd.c_str(), L"r");
+#else
+    FILE *pipe = popen(cmd.c_str(), "r");
+#endif
+    if (!pipe) return "";
+    size_t n;
+    while ((n = fread(buffer.data(), 1, buffer.size(), pipe)) > 0) {
+        result.append(buffer.data(), n);
+    }
+#ifdef _WIN32
+    _pclose(pipe);
+#else
+    pclose(pipe);
+#endif
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r' || result.back() == ' ')) {
+        result.pop_back();
+    }
+    return result;
+}
+
 std::string SnapshotManager::track(bool forceInitialize)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     LOG_INFO("[track] enter, worktree=" + m_worktree + " initialized=" + (m_initialized ? "true" : "false"));
 
-    // Lazy init: only create the bare repo when the worktree has changes.
-    // Clean repos are skipped entirely — no bare repo is created on disk.
+    // Lazy init: only create the shadow repo when the worktree has changes.
+    // Clean repos are skipped entirely — no shadow repo is created on disk.
     bool firstInit = false;
     if (!m_initialized) {
         if (!isGitAvailable()) {
@@ -451,71 +515,38 @@ std::string SnapshotManager::track(bool forceInitialize)
     // -z terminates each entry with NUL (no C-style quoting) and --no-renames
     // suppresses "R  old -> new" records, so every entry is exactly "XY <path>".
     // core.quotepath=false keeps non-ASCII (e.g. Chinese) paths as raw UTF-8
-    // instead of octal escapes. This fixes three old parser bugs: renamed files
-    // were read as one bogus path, non-ASCII paths forced an expensive full
-    // add -A, and filenames with glob chars could be misinterpreted by git.
-    std::vector<std::string> files;
-    size_t pos = 0;
-    while (pos < status.size()) {
-        size_t nul = status.find('\0', pos);
-        if (nul == std::string::npos) nul = status.size();
-        std::string entry = status.substr(pos, nul - pos);
-        pos = nul + 1;
-        if (entry.size() < 4) continue;  // "XY " plus at least one path char
-        std::string filePath = entry.substr(3);
-        if (filePath.empty()) continue;
-        files.push_back(filePath);
+    // instead of octal escapes.
+    auto files = parseStatusPaths(status);
+    for (const auto &f : files) {
+        LOG_INFO("[track] changed file: [" + f + "]");
     }
+    LOG_INFO("[track] staging " + std::to_string(files.size()) + " files...");
 
-    // Batch git add by command length, not only file count. Long Windows
-    // paths can exceed cmd.exe's limit even when a batch has fewer than 200 files.
-    if (!files.empty()) {
-        for (const auto &f : files) {
-            LOG_INFO("[track] changed file: [" + f + "]");
-        }
-        LOG_INFO("[track] git add " + std::to_string(files.size()) + " files in batches...");
-        const size_t maxBatchLength = 8000;
-        std::string batch;
-        std::string addResult;
-        for (const auto &file : files) {
-            std::string argument = "\"" + file + "\"";
-            if (!batch.empty() && batch.size() + argument.size() + 1 > maxBatchLength) {
-                addResult += gitExec("add " + batch, true);
-                batch.clear();
-            }
-            if (!batch.empty()) batch += " ";
-            batch += argument;
-        }
-        if (!batch.empty()) addResult += gitExec("add " + batch, true);
-
-        // Targeted add failed for some other reason (e.g. a path with glob
-        // characters git still expands, or a non-ASCII name cmd.exe mangled on
-        // Windows). Retry with the full scan so staging isn't lost.
-        if (addResult.find("fatal:") != std::string::npos || addResult.find("error:") != std::string::npos) {
-            LOG_ERROR("[track] targeted git add failed, falling back to add -A: " + addResult);
-            std::string fallback = gitExec("add -A", true);
-            if (fallback.find("fatal:") != std::string::npos || fallback.find("error:") != std::string::npos) {
-                LOG_ERROR("[track] fallback git add -A failed: " + fallback);
-            }
-        }
-        LOG_INFO("[track] git add done (" + std::to_string(files.size()) + " files)");
-    }
-
-    // Write tree object
-    LOG_INFO("[track] running write-tree...");
-    std::string treeHash = gitExec("write-tree", true);
-    if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
-        LOG_ERROR("Failed to write tree: " + treeHash);
+    std::string treeHash = stageAndCommitLocked(files);
+    if (treeHash.empty()) {
+        LOG_ERROR("[track] stageAndCommitLocked failed");
         return "";
     }
-    LOG_INFO("[track] write-tree done, hash=" + treeHash);
 
-    // Advance HEAD to the just-written tree. Without this, files staged by
-    // the add above (but never committed) would keep reappearing as "M " in
-    // every later status, re-staging them on each track() call.
-    commitTreeLocked(treeHash);
-
+    LOG_INFO("[track] tree=" + treeHash);
     LOG_DEBUG("Snapshot tracked: tree=" + treeHash + " (" + std::to_string(files.size()) + " files)");
+    return treeHash;
+}
+
+// Stage all working tree changes and write the tree, but do NOT commit.
+// HEAD stays at the baseline so that changedFilesFromHead() and revertAll()
+// continue to work against the original baseline throughout the conversation.
+std::string SnapshotManager::stageAndWriteTree() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    gitExec("add -A", true);
+    std::string treeHash = gitExec("write-tree", true);
+    if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
+        LOG_ERROR("[stageAndWriteTree] write-tree failed: " + treeHash);
+        return "";
+    }
+    LOG_INFO("[stageAndWriteTree] tree=" + treeHash);
     return treeHash;
 }
 
@@ -564,6 +595,251 @@ std::string SnapshotManager::ensureBaselineCommitLocked() const
         return "";
     }
     LOG_INFO("[track] baseline established, tree=" + treeHash);
+    commitTreeLocked(treeHash);
+    return treeHash;
+}
+
+void SnapshotManager::initBaseline()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!isGitAvailable()) {
+        LOG_WARN("[initBaseline] git not available");
+        return;
+    }
+
+    // Initialize shadow repo if it doesn't exist yet
+    if (!m_initialized) {
+        m_initialized = initRepoLocked();
+        if (!m_initialized) {
+            LOG_ERROR("[initBaseline] initRepoLocked failed");
+            return;
+        }
+    }
+
+    // If HEAD is valid, sync to current state
+    if (hasValidHeadLocked()) {
+        LOG_INFO("[initBaseline] valid HEAD found, syncing to current state");
+        std::string status = gitExec("-c core.quotepath=false status --porcelain -z --no-renames", true);
+        auto files = parseStatusPaths(status);
+        if (!files.empty()) {
+            std::string treeHash = stageAndCommitLocked(files);
+            if (treeHash.empty()) LOG_ERROR("[initBaseline] stageAndCommitLocked failed");
+        }
+        return;
+    }
+
+    // No valid HEAD — establish baseline
+    // Try alternates fast path if worktree is a git repo
+    if (isGitRepo(m_worktree)) {
+        if (initAlternatesBaselineLocked()) {
+            LOG_INFO("[initBaseline] alternates baseline established");
+            return;
+        }
+    }
+
+    // Fallback: git add -A (slow but works for non-git directories)
+    LOG_INFO("[initBaseline] fallback to git add -A baseline");
+    ensureBaselineCommitLocked();
+}
+
+bool SnapshotManager::initAlternatesBaselineLocked()
+{
+    // Get the worktree's .git directory path
+    std::string gitDir = worktreeGitExec("rev-parse --git-dir");
+    if (gitDir.empty() || gitDir.find("fatal") != std::string::npos) {
+        LOG_INFO("[initAlternates] worktree is not a git repo");
+        return false;
+    }
+
+    // Resolve to absolute path if relative (e.g. ".git")
+    if (gitDir[0] != '/' && !(gitDir.size() > 1 && gitDir[1] == ':')) {
+        gitDir = m_worktree + PATH_SEP + gitDir;
+    }
+    // Normalize separators
+    std::replace(gitDir.begin(), gitDir.end(), '/', '\\');
+
+    std::string objectsPath = gitDir + PATH_SEP + "objects";
+
+    // Verify objects directory exists
+    std::error_code ec;
+    if (!fs::exists(objectsPath, ec)) {
+        LOG_ERROR("[initAlternates] objects path not found: " + objectsPath);
+        return false;
+    }
+
+    // Write alternates file
+    std::string altDir = m_repoPath + PATH_SEP + "objects" + PATH_SEP + "info";
+#ifdef _WIN32
+    _mkdir(altDir.c_str());
+#else
+    mkdir(altDir.c_str(), 0755);
+#endif
+    std::string altPath = altDir + PATH_SEP + "alternates";
+    std::ofstream altFile(altPath);
+    if (!altFile.is_open()) {
+        LOG_ERROR("[initAlternates] failed to write alternates file");
+        return false;
+    }
+    altFile << objectsPath << "\n";
+    altFile.close();
+    LOG_INFO("[initAlternates] alternates -> " + objectsPath);
+
+    // Get the worktree's HEAD^{tree} hash
+    std::string treeHash = worktreeGitExec("rev-parse HEAD^{tree}");
+    if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
+        LOG_ERROR("[initAlternates] failed to get worktree HEAD tree: " + treeHash);
+        return false;
+    }
+    LOG_INFO("[initAlternates] worktree tree hash: " + treeHash);
+
+    // Create baseline commit in shadow repo using worktree's tree
+    commitTreeLocked(treeHash);
+
+    // Sync index to HEAD so git status works correctly
+    gitExec("read-tree HEAD", true);
+
+    m_usingAlternates = true;
+    LOG_INFO("[initAlternates] baseline established via alternates");
+    return true;
+}
+
+SnapshotManager::HunkRange SnapshotManager::parseHunkHeader(const std::string &line)
+{
+    HunkRange r{0, 1, 0, 1};
+    auto minusPos = line.find('-', 3);
+    auto plusPos = line.find('+', 3);
+    if (minusPos == std::string::npos || plusPos == std::string::npos) return r;
+
+    // Parse -oldStart[,oldCount]
+    auto commaOld = line.find(',', minusPos);
+    r.oldStart = std::atoi(line.substr(minusPos + 1,
+        (commaOld != std::string::npos ? commaOld : plusPos) - minusPos - 1).c_str());
+    if (commaOld != std::string::npos)
+        r.oldCount = std::atoi(line.substr(commaOld + 1, plusPos - commaOld - 2).c_str());
+
+    // Parse +newStart[,newCount]
+    auto commaNew = line.find(',', plusPos);
+    auto spacePos = line.find(' ', plusPos);
+    r.newStart = std::atoi(line.substr(plusPos + 1,
+        (commaNew != std::string::npos ? commaNew : spacePos) - plusPos - 1).c_str());
+    if (commaNew != std::string::npos && spacePos != std::string::npos)
+        r.newCount = std::atoi(line.substr(commaNew + 1, spacePos - commaNew - 1).c_str());
+
+    return r;
+}
+
+json SnapshotManager::parseDiffToHunks(const std::string &diffOutput)
+{
+    json hunks = json::array();
+    json currentHunk;
+    int oldLine = 0, newLine = 0;
+    bool inHunk = false;
+
+    auto finalizeHunk = [&]() {
+        if (inHunk && !currentHunk.is_null())
+            hunks.push_back(currentHunk);
+    };
+
+    std::istringstream stream(diffOutput);
+    std::string line;
+
+    while (std::getline(stream, line)) {
+        if (line.rfind("@@", 0) == 0) {
+            finalizeHunk();
+            auto r = parseHunkHeader(line);
+            currentHunk = json::object({
+                {"header", line},
+                {"lines", json::array()},
+                {"oldStart", r.oldStart}, {"oldCount", r.oldCount},
+                {"newStart", r.newStart}, {"newCount", r.newCount}
+            });
+            oldLine = r.oldStart;
+            newLine = r.newStart;
+            inHunk = true;
+            continue;
+        }
+
+        if (!inHunk || line.empty()) continue;
+
+        if (line[0] == '+' && line.substr(0, 3) != "+++") {
+            currentHunk["lines"].push_back(json::object({
+                {"type", "addition"}, {"content", line},
+                {"oldLineNo", -1}, {"newLineNo", newLine}
+            }));
+            newLine++;
+        } else if (line[0] == '-' && line.substr(0, 3) != "---") {
+            currentHunk["lines"].push_back(json::object({
+                {"type", "deletion"}, {"content", line},
+                {"oldLineNo", oldLine}, {"newLineNo", -1}
+            }));
+            oldLine++;
+        } else if (line[0] == ' ') {
+            currentHunk["lines"].push_back(json::object({
+                {"type", "context"}, {"content", line},
+                {"oldLineNo", oldLine}, {"newLineNo", newLine}
+            }));
+            oldLine++;
+            newLine++;
+        }
+    }
+
+    finalizeHunk();
+    return hunks;
+}
+
+std::vector<std::string> SnapshotManager::parseStatusPaths(const std::string &statusOutput)
+{
+    std::vector<std::string> files;
+    size_t pos = 0;
+    while (pos < statusOutput.size()) {
+        size_t nul = statusOutput.find('\0', pos);
+        if (nul == std::string::npos) nul = statusOutput.size();
+        std::string entry = statusOutput.substr(pos, nul - pos);
+        pos = nul + 1;
+        if (entry.size() >= 4) {
+            std::string filePath = entry.substr(3);
+            if (!filePath.empty()) files.push_back(filePath);
+        }
+    }
+    return files;
+}
+
+std::string SnapshotManager::stageAndCommitLocked(const std::vector<std::string> &files) const
+{
+    if (files.empty()) {
+        std::string treeHash = gitExec("write-tree", true);
+        if (!treeHash.empty() && treeHash.find("fatal") == std::string::npos)
+            commitTreeLocked(treeHash);
+        return treeHash;
+    }
+
+    // Batch git add by command length to stay within cmd.exe limits
+    const size_t maxBatchLength = 8000;
+    std::string batch, addResult;
+    for (const auto &file : files) {
+        std::string arg = "\"" + file + "\"";
+        if (!batch.empty() && batch.size() + arg.size() + 1 > maxBatchLength) {
+            addResult += gitExec("add " + batch, true);
+            batch.clear();
+        }
+        if (!batch.empty()) batch += " ";
+        batch += arg;
+    }
+    if (!batch.empty())
+        addResult += gitExec("add " + batch, true);
+
+    // Fallback to full scan if targeted add failed
+    if (addResult.find("fatal:") != std::string::npos ||
+        addResult.find("error:") != std::string::npos) {
+        LOG_ERROR("[stageAndCommit] targeted add failed, falling back to add -A: " + addResult);
+        gitExec("add -A", true);
+    }
+
+    std::string treeHash = gitExec("write-tree", true);
+    if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
+        LOG_ERROR("[stageAndCommit] write-tree failed: " + treeHash);
+        return "";
+    }
     commitTreeLocked(treeHash);
     return treeHash;
 }
@@ -672,108 +948,7 @@ json SnapshotManager::diffFile(const std::string &fromHash, const std::string &t
     }
 
     // Parse the unified diff into hunks compatible with cvs::DiffContent
-    json hunks = json::array();
-    json currentHunk;
-    int oldLine = 0, newLine = 0;
-    int oldStart = 0, oldCount = 0, newStart = 0, newCount = 0;
-    bool inHunk = false;
-    
-    std::istringstream stream(diffOutput);
-    std::string line;
-    
-    while (std::getline(stream, line)) {
-        // Parse hunk header: @@ -old_start,old_count +new_start,new_count @@
-        if (line.rfind("@@", 0) == 0) {
-            // Save previous hunk if exists
-            if (inHunk && !currentHunk.is_null()) {
-                currentHunk["oldStart"] = oldStart;
-                currentHunk["oldCount"] = oldCount;
-                currentHunk["newStart"] = newStart;
-                currentHunk["newCount"] = newCount;
-                hunks.push_back(currentHunk);
-            }
-            
-            // Parse new hunk header
-            auto plusPos = line.find('+', 3);
-            auto commaPos = line.find(',', plusPos);
-            auto spacePos = line.find(' ', plusPos);
-            if (plusPos != std::string::npos) {
-                std::string newStartStr = line.substr(plusPos + 1, 
-                    (commaPos != std::string::npos ? commaPos : spacePos) - plusPos - 1);
-                newStart = std::atoi(newStartStr.c_str());
-                newLine = newStart;
-                if (commaPos != std::string::npos && spacePos != std::string::npos) {
-                    std::string newCountStr = line.substr(commaPos + 1, spacePos - commaPos - 1);
-                    newCount = std::atoi(newCountStr.c_str());
-                } else {
-                    newCount = 1;
-                }
-            }
-            auto minusPos = line.find('-', 3);
-            auto commaPos2 = line.find(',', minusPos);
-            if (minusPos != std::string::npos) {
-                std::string oldStartStr = line.substr(minusPos + 1,
-                    (commaPos2 != std::string::npos ? commaPos2 : plusPos) - minusPos - 1);
-                oldStart = std::atoi(oldStartStr.c_str());
-                oldLine = oldStart;
-                if (commaPos2 != std::string::npos) {
-                    std::string oldCountStr = line.substr(commaPos2 + 1, plusPos - commaPos2 - 2);
-                    oldCount = std::atoi(oldCountStr.c_str());
-                } else {
-                    oldCount = 1;
-                }
-            }
-            
-            currentHunk = json::object();
-            currentHunk["header"] = line;
-            currentHunk["lines"] = json::array();
-            inHunk = true;
-            continue;
-        }
-        
-        if (!inHunk || line.empty()) continue;
-        
-        // Added line
-        if (line[0] == '+' && line.substr(0, 3) != "+++") {
-            json diffLine;
-            diffLine["type"] = "addition";
-            diffLine["content"] = line;  // Keep the + prefix for DiffEditorWidget
-            diffLine["oldLineNo"] = -1;
-            diffLine["newLineNo"] = newLine;
-            currentHunk["lines"].push_back(diffLine);
-            newLine++;
-        }
-        // Removed line
-        else if (line[0] == '-' && line.substr(0, 3) != "---") {
-            json diffLine;
-            diffLine["type"] = "deletion";
-            diffLine["content"] = line;  // Keep the - prefix for DiffEditorWidget
-            diffLine["oldLineNo"] = oldLine;
-            diffLine["newLineNo"] = -1;
-            currentHunk["lines"].push_back(diffLine);
-            oldLine++;
-        }
-        // Context line
-        else if (line[0] == ' ') {
-            json diffLine;
-            diffLine["type"] = "context";
-            diffLine["content"] = line;  // Keep the space prefix
-            diffLine["oldLineNo"] = oldLine;
-            diffLine["newLineNo"] = newLine;
-            currentHunk["lines"].push_back(diffLine);
-            oldLine++;
-            newLine++;
-        }
-    }
-    
-    // Save last hunk
-    if (inHunk && !currentHunk.is_null()) {
-        currentHunk["oldStart"] = oldStart;
-        currentHunk["oldCount"] = oldCount;
-        currentHunk["newStart"] = newStart;
-        currentHunk["newCount"] = newCount;
-        hunks.push_back(currentHunk);
-    }
+    json hunks = parseDiffToHunks(diffOutput);
 
     json d;
     d["file"] = filePath;
@@ -782,6 +957,213 @@ json SnapshotManager::diffFile(const std::string &fromHash, const std::string &t
     result.push_back(d);
 
     return result;
+}
+
+json SnapshotManager::diffFromHead(const std::string &filePath) const
+{
+    json result = json::array();
+    if (!m_initialized || filePath.empty()) return result;
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (!hasValidHeadLocked()) {
+        LOG_INFO("[diffFromHead] no valid HEAD");
+        return result;
+    }
+
+    // Check if the file is untracked (new file not in HEAD).
+    std::string statusCheck = gitExec(
+        "-c core.quotepath=false status --porcelain -- \"" + filePath + "\"", true);
+    bool isUntracked = (statusCheck.find("??") == 0);
+
+    if (isUntracked) {
+        // Untracked file: entire content is new additions.
+        // Read the file from the worktree and create a single hunk.
+        std::string fullPath = m_worktree + PATH_SEP + filePath;
+        std::ifstream ifs(fullPath, std::ios::binary);
+        if (!ifs.is_open()) {
+            json d;
+            d["file"] = filePath;
+            d["status"] = "added";
+            d["hunks"] = json::array();
+            result.push_back(d);
+            return result;
+        }
+        std::string content((std::istreambuf_iterator<char>(ifs)),
+                             std::istreambuf_iterator<char>());
+        ifs.close();
+
+        // Build a single hunk with all lines as additions
+        json hunks = json::array();
+        json hunk;
+        hunk["oldStart"] = 0;
+        hunk["oldCount"] = 0;
+
+        json lines = json::array();
+        int lineNo = 1;
+        std::istringstream stream(content);
+        std::string line;
+        while (std::getline(stream, line)) {
+            lines.push_back(json::object({
+                {"type", "addition"},
+                {"content", "+" + line},
+                {"oldLineNo", -1},
+                {"newLineNo", lineNo++}
+            }));
+        }
+        hunk["newStart"] = 1;
+        hunk["newCount"] = (int)lines.size();
+        hunk["header"] = "@@ -0,0 +1," + std::to_string(lines.size()) + " @@";
+        hunk["lines"] = lines;
+        hunks.push_back(hunk);
+
+        json d;
+        d["file"] = filePath;
+        d["status"] = "added";
+        d["hunks"] = hunks;
+        result.push_back(d);
+        return result;
+    }
+
+    // Tracked file: use git diff HEAD
+    std::string nameStatus = gitExec(
+        "-c core.quotepath=false diff --no-ext-diff --no-renames --name-status HEAD -- \"" + filePath + "\"", true);
+    std::string status = "modified";
+    if (nameStatus.empty()) {
+        // No diff — file unchanged
+        json d;
+        d["file"] = filePath;
+        d["status"] = "no_changes";
+        d["hunks"] = json::array();
+        result.push_back(d);
+        return result;
+    }
+    auto tab = nameStatus.find('\t');
+    if (tab != std::string::npos) {
+        std::string code = nameStatus.substr(0, tab);
+        status = code.rfind('A', 0) == 0 ? "added"
+                 : code.rfind('D', 0) == 0 ? "deleted" : "modified";
+    }
+
+    // Get unified diff: working tree vs HEAD
+    std::string diffOutput = gitExec(
+        "-c core.quotepath=false diff --no-ext-diff --no-renames -U3 HEAD -- \"" + filePath + "\"", true);
+    if (diffOutput.find("fatal:") != std::string::npos || diffOutput.find("error:") != std::string::npos) {
+        LOG_ERROR("[diffFromHead] diff failed for: " + filePath + " - " + diffOutput);
+        diffOutput.clear();
+    }
+
+    json hunks = parseDiffToHunks(diffOutput);
+
+    json d;
+    d["file"] = filePath;
+    d["status"] = status;
+    d["hunks"] = hunks;
+    result.push_back(d);
+
+    return result;
+}
+
+std::vector<PatchEntry> SnapshotManager::changedFilesFromHead() const
+{
+    std::vector<PatchEntry> result;
+    if (!m_initialized) return result;
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (!hasValidHeadLocked()) return result;
+
+    // Use git status --porcelain to detect all changes including untracked files.
+    std::string output = gitExec(
+        "-c core.quotepath=false status --porcelain -z --no-renames", true);
+    if (output.empty() || output.find("fatal:") != std::string::npos) return result;
+
+    // Parse -z format: XY\0path\0XY\0path\0...
+    size_t pos = 0;
+    while (pos < output.size()) {
+        if (pos + 2 > output.size()) break;
+        std::string code = output.substr(pos, 2);
+        pos += 2;
+        if (pos < output.size() && output[pos] == ' ') pos++;
+        if (pos < output.size() && output[pos] == '\0') pos++;
+
+        size_t pathEnd = output.find('\0', pos);
+        if (pathEnd == std::string::npos) break;
+        std::string filePath = output.substr(pos, pathEnd - pos);
+        pos = pathEnd + 1;
+
+        std::string status;
+        if (code == "??") {
+            status = "added";
+        } else if (code[0] == 'A' || code[1] == 'A') {
+            status = "added";
+        } else if (code[0] == 'D' || code[1] == 'D') {
+            status = "deleted";
+        } else {
+            status = "modified";
+        }
+
+        PatchEntry entry;
+        entry.filePath = filePath;
+        entry.status = status;
+        result.push_back(std::move(entry));
+    }
+    return result;
+}
+
+bool SnapshotManager::revertFile(const std::string &filePath)
+{
+    if (!m_initialized || filePath.empty()) return false;
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (!hasValidHeadLocked()) {
+        LOG_ERROR("[revertFile] no valid HEAD");
+        return false;
+    }
+
+    // Check if file exists in HEAD
+    std::string lsResult = gitExec("ls-tree HEAD -- \"" + filePath + "\"", true);
+    if (lsResult.empty() || lsResult.find("fatal") != std::string::npos) {
+        // File doesn't exist in HEAD — it was added, so delete it
+        std::string fullPath = m_worktree + PATH_SEP + filePath;
+        std::error_code ec;
+        fs::remove(fullPath, ec);
+        if (ec) {
+            LOG_ERROR("[revertFile] failed to delete new file: " + fullPath);
+            return false;
+        }
+        LOG_INFO("[revertFile] deleted new file: " + filePath);
+        return true;
+    }
+
+    // File exists in HEAD — restore it
+    bool ok = gitExecBool("checkout HEAD -- \"" + filePath + "\"", true);
+    if (ok) {
+        LOG_INFO("[revertFile] reverted: " + filePath);
+    } else {
+        LOG_ERROR("[revertFile] checkout failed for: " + filePath);
+    }
+    return ok;
+}
+
+bool SnapshotManager::revertAll()
+{
+    if (!m_initialized) return false;
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (!hasValidHeadLocked()) {
+        LOG_ERROR("[revertAll] no valid HEAD");
+        return false;
+    }
+
+    // Restore all tracked files to HEAD state
+    bool ok = gitExecBool("checkout HEAD -- .", true);
+    if (ok) {
+        // Also remove untracked files that were added since HEAD
+        gitExec("clean -fd", true);
+        LOG_INFO("[revertAll] all changes reverted to HEAD");
+    } else {
+        LOG_ERROR("[revertAll] checkout HEAD -- . failed");
+    }
+    return ok;
 }
 
 std::vector<PatchEntry> SnapshotManager::diffTrees(const std::string &fromHash, const std::string &toHash) const

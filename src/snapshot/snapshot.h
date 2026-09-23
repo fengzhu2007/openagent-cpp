@@ -44,10 +44,21 @@ public:
     // Check if the snapshot repo is initialized
     bool isInitialized() const;
 
+    // Initialize baseline on startup. For git repos, uses alternates for fast
+    // init (< 100ms). For non-git directories, falls back to git add -A.
+    // If shadow repo already exists with valid HEAD, calls track() to sync.
+    void initBaseline();
+
     // Track current file state: stages changes, writes tree, returns tree hash.
     // forceInitialize establishes a baseline even when the source repo is clean.
     // Returns empty string on failure.
     std::string track(bool forceInitialize = false);
+
+    // Stage all working tree changes and write the tree, but do NOT commit.
+    // Returns the tree hash reflecting the current working tree state.
+    // HEAD remains at the baseline — used by recordStepEndState to capture
+    // step snapshots without advancing HEAD.
+    std::string stageAndWriteTree() const;
 
     // Get the diff (list of changed files) between a snapshot hash and current state
     std::vector<PatchEntry> patch(const std::string &treeHash) const;
@@ -58,6 +69,20 @@ public:
 
     // Compute diff for a single file between two tree hashes
     json diffFile(const std::string &fromHash, const std::string &toHash, const std::string &filePath) const;
+
+    // Compute diff for a single file: working directory vs HEAD.
+    // No track() needed — reads working tree changes directly.
+    json diffFromHead(const std::string &filePath) const;
+
+    // Get list of all changed files: working directory vs HEAD.
+    // Returns PatchEntry list with filePath and status (added/modified/deleted).
+    std::vector<PatchEntry> changedFilesFromHead() const;
+
+    // Revert a single file to HEAD state (git checkout HEAD -- file)
+    bool revertFile(const std::string &filePath);
+
+    // Revert all changes to HEAD state (git checkout HEAD -- .)
+    bool revertAll();
 
     // Restore files to the state captured in a specific tree hash
     bool restore(const std::string &treeHash);
@@ -96,6 +121,10 @@ private:
     // Execute a git command in the snapshot repo and return stdout
     std::string gitExec(const std::string &args, bool inWorktree = false) const;
 
+    // Execute a git command in the worktree's OWN git repo (no GIT_DIR override).
+    // Used to read the worktree's HEAD/tree hashes for alternates init.
+    std::string worktreeGitExec(const std::string &args) const;
+
     // Execute a git command and return success/failure
     bool gitExecBool(const std::string &args, bool inWorktree = false) const;
 
@@ -119,6 +148,24 @@ private:
     // Caller must hold m_mutex.
     std::string ensureBaselineCommitLocked() const;
 
+    // Set up alternates to reuse worktree's .git/objects and create baseline
+    // from worktree's HEAD tree hash. Caller must hold m_mutex.
+    bool initAlternatesBaselineLocked();
+
+    // Parse unified diff output into hunks array (compatible with cvs::DiffContent)
+    static json parseDiffToHunks(const std::string &diffOutput);
+
+    // Parse @@ -old,count +new,count @@ header into components
+    struct HunkRange { int oldStart, oldCount, newStart, newCount; };
+    static HunkRange parseHunkHeader(const std::string &line);
+
+    // Parse NUL-separated git status --porcelain -z output into file paths
+    static std::vector<std::string> parseStatusPaths(const std::string &statusOutput);
+
+    // Stage listed files and commit as a new tree. Returns tree hash.
+    // Caller must hold m_mutex.
+    std::string stageAndCommitLocked(const std::vector<std::string> &files) const;
+
     // Compute a short hash of the worktree path for repo naming
     static std::string hashPath(const std::string &path);
 
@@ -129,5 +176,6 @@ private:
     std::string m_worktree;
     std::string m_repoPath;
     bool m_initialized = false;
+    bool m_usingAlternates = false;
     mutable std::mutex m_mutex;
 };

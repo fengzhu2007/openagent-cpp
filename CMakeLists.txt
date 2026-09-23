@@ -40,6 +40,7 @@ set(OPENCODE_SOURCES
     src/util/logger.cpp
     src/util/uuid.cpp
     src/util/httplib_client.cpp
+    src/util/utf8.cpp
     src/database/database.cpp
     src/database/schema.cpp
     src/event/event_bus.cpp
@@ -101,6 +102,7 @@ set(OPENCODE_HEADERS
     src/util/logger.h
     src/util/uuid.h
     src/util/httplib_client.h
+    src/util/utf8.h
     src/database/database.h
     src/database/schema.h
     src/event/event_bus.h
