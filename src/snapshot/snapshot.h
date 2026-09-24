@@ -166,6 +166,10 @@ private:
     // Caller must hold m_mutex.
     std::string stageAndCommitLocked(const std::vector<std::string> &files) const;
 
+    // Stage listed files (batched) and write the tree WITHOUT committing.
+    // Returns tree hash or "" on failure. Caller must hold m_mutex.
+    std::string stageAndWriteTreeLocked(const std::vector<std::string> &files) const;
+
     // Compute a short hash of the worktree path for repo naming
     static std::string hashPath(const std::string &path);
 

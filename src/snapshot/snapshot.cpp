@@ -533,21 +533,17 @@ std::string SnapshotManager::track(bool forceInitialize)
     return treeHash;
 }
 
-// Stage all working tree changes and write the tree, but do NOT commit.
-// HEAD stays at the baseline so that changedFilesFromHead() and revertAll()
-// continue to work against the original baseline throughout the conversation.
+// Stage current worktree changes and write the tree WITHOUT committing.
+// HEAD stays at the baseline so changedFilesFromHead()/diffFromHead()/revert
+// keep reporting worktree changes. Used by recordStepEndState step snapshots.
+// Selective staging mirrors track() to avoid full-worktree git add -A scans.
 std::string SnapshotManager::stageAndWriteTree() const
 {
+    if (!m_initialized) return "";
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    gitExec("add -A", true);
-    std::string treeHash = gitExec("write-tree", true);
-    if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
-        LOG_ERROR("[stageAndWriteTree] write-tree failed: " + treeHash);
-        return "";
-    }
-    LOG_INFO("[stageAndWriteTree] tree=" + treeHash);
-    return treeHash;
+    std::string status = gitExec("-c core.quotepath=false status --porcelain -z --no-renames", true);
+    return stageAndWriteTreeLocked(parseStatusPaths(status));
 }
 
 // True when the snapshot repo has at least one commit on HEAD.
@@ -684,8 +680,11 @@ bool SnapshotManager::initAlternatesBaselineLocked()
     altFile.close();
     LOG_INFO("[initAlternates] alternates -> " + objectsPath);
 
-    // Get the worktree's HEAD^{tree} hash
-    std::string treeHash = worktreeGitExec("rev-parse HEAD^{tree}");
+    // Get the worktree's HEAD^{tree} hash.
+    // ^ must be quoted: _wpopen runs commands via cmd.exe, where ^ is the
+    // escape character — an unquoted HEAD^{tree} reaches git as HEAD{tree}
+    // and rev-parse fails with "unknown revision".
+    std::string treeHash = worktreeGitExec("rev-parse \"HEAD^{tree}\"");
     if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
         LOG_ERROR("[initAlternates] failed to get worktree HEAD tree: " + treeHash);
         return false;
@@ -806,41 +805,46 @@ std::vector<std::string> SnapshotManager::parseStatusPaths(const std::string &st
 
 std::string SnapshotManager::stageAndCommitLocked(const std::vector<std::string> &files) const
 {
-    if (files.empty()) {
-        std::string treeHash = gitExec("write-tree", true);
-        if (!treeHash.empty() && treeHash.find("fatal") == std::string::npos)
-            commitTreeLocked(treeHash);
-        return treeHash;
-    }
+    std::string treeHash = stageAndWriteTreeLocked(files);
+    if (treeHash.empty()) return "";
+    commitTreeLocked(treeHash);
+    return treeHash;
+}
 
-    // Batch git add by command length to stay within cmd.exe limits
-    const size_t maxBatchLength = 8000;
-    std::string batch, addResult;
-    for (const auto &file : files) {
-        std::string arg = "\"" + file + "\"";
-        if (!batch.empty() && batch.size() + arg.size() + 1 > maxBatchLength) {
-            addResult += gitExec("add " + batch, true);
-            batch.clear();
+// Stage the listed files (batched add, add -A fallback on failure) and write
+// the tree. No commit — HEAD is left untouched. Returns the tree hash or ""
+// on failure. Caller must hold m_mutex.
+std::string SnapshotManager::stageAndWriteTreeLocked(const std::vector<std::string> &files) const
+{
+    if (!files.empty()) {
+        // Batch git add by command length to stay within cmd.exe limits
+        const size_t maxBatchLength = 8000;
+        std::string batch, addResult;
+        for (const auto &file : files) {
+            std::string arg = "\"" + file + "\"";
+            if (!batch.empty() && batch.size() + arg.size() + 1 > maxBatchLength) {
+                addResult += gitExec("add " + batch, true);
+                batch.clear();
+            }
+            if (!batch.empty()) batch += " ";
+            batch += arg;
         }
-        if (!batch.empty()) batch += " ";
-        batch += arg;
-    }
-    if (!batch.empty())
-        addResult += gitExec("add " + batch, true);
+        if (!batch.empty())
+            addResult += gitExec("add " + batch, true);
 
-    // Fallback to full scan if targeted add failed
-    if (addResult.find("fatal:") != std::string::npos ||
-        addResult.find("error:") != std::string::npos) {
-        LOG_ERROR("[stageAndCommit] targeted add failed, falling back to add -A: " + addResult);
-        gitExec("add -A", true);
+        // Fallback to full scan if targeted add failed
+        if (addResult.find("fatal:") != std::string::npos ||
+            addResult.find("error:") != std::string::npos) {
+            LOG_ERROR("[stageAndWriteTree] targeted add failed, falling back to add -A: " + addResult);
+            gitExec("add -A", true);
+        }
     }
 
     std::string treeHash = gitExec("write-tree", true);
     if (treeHash.empty() || treeHash.find("fatal") != std::string::npos) {
-        LOG_ERROR("[stageAndCommit] write-tree failed: " + treeHash);
+        LOG_ERROR("[stageAndWriteTree] write-tree failed: " + treeHash);
         return "";
     }
-    commitTreeLocked(treeHash);
     return treeHash;
 }
 
