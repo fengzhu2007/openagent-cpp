@@ -148,7 +148,7 @@ Server::Server(const std::string &host, uint16_t port,
     m_memory = std::make_unique<MemoryManager>(m_db, m_events, m_config);
     m_memory->setProviderRegistry(&m_providers);
     m_memory->start();
-    m_prompt = std::make_unique<SessionPrompt>(m_sessionMgr, m_providers, m_tools, m_events, m_config, m_permission.get(), nullptr, m_agents.get(), m_memory.get());
+    m_prompt = std::make_unique<SessionPrompt>(m_sessionMgr, m_providers, m_tools, m_events, m_config, m_permission.get(), nullptr, m_agents.get(), m_memory.get(), m_skills.get());
     // Set the working directories getter so SessionPrompt can access global working dirs
     m_prompt->setWorkingDirsGetter([this]() { return workingDirs(); });
     // Give SessionPrompt access to all snapshot managers

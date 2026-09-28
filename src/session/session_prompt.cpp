@@ -153,9 +153,10 @@ static std::vector<uint8_t> readFileBinary(const std::string &path) {
 SessionPrompt::SessionPrompt(SessionManager &sessionMgr, ProviderRegistry &providers,
                              ToolRegistry &tools, EventBus &events, Config &config,
                              PermissionManager *permission, SnapshotManager *snapshot,
-                             AgentManager *agents, MemoryManager *memory)
+                             AgentManager *agents, MemoryManager *memory,
+                             SkillManager *skills)
     : m_sessionMgr(sessionMgr), m_providers(providers), m_tools(tools), m_events(events), m_config(config),
-      m_permission(permission), m_agents(agents), m_memory(memory)
+      m_permission(permission), m_agents(agents), m_memory(memory), m_skills(skills)
 {
     // Note: snapshot parameter kept for API compat but no longer stored.
     // Multi-directory snapshots are accessed via m_snapshotsGetter callback.
@@ -288,6 +289,34 @@ std::string SessionPrompt::buildSystemPrompt(const SessionInfo &session)
         std::string kgContext = m_memory->buildKnowledgeContext("", session.projectId);
         if (!kgContext.empty()) {
             prompt += "\n" + kgContext;
+        }
+    }
+
+    // Inject available skills guidance so the LLM knows which skills exist
+    // and when to invoke the skill tool (mirrors opencode SkillGuidance).
+    if (m_skills) {
+        auto skills = m_skills->listSkills();
+        // Only include skills that have a description (undocumented skills are
+        // still callable via the tool enum but not advertised).
+        std::vector<const Skill *> documented;
+        for (const auto &s : skills) {
+            if (!s.description.empty()) documented.push_back(&s);
+        }
+        if (!documented.empty()) {
+            std::sort(documented.begin(), documented.end(),
+                      [](const Skill *a, const Skill *b) { return a->name < b->name; });
+            std::ostringstream ss;
+            ss << "\nSkills provide specialized instructions and workflows for specific tasks.\n"
+               << "Use the skill tool to load a skill when a task matches its description.\n"
+               << "<available_skills>\n";
+            for (const auto *s : documented) {
+                ss << "  <skill>\n"
+                   << "    <name>" << s->name << "</name>\n"
+                   << "    <description>" << s->description << "</description>\n"
+                   << "  </skill>\n";
+            }
+            ss << "</available_skills>\n";
+            prompt += ss.str();
         }
     }
 

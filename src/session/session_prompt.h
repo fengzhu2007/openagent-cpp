@@ -9,6 +9,7 @@
 #include "snapshot/snapshot.h"
 #include "agent/agent.h"
 #include "memory/memory_manager.h"
+#include "skill/skill.h"
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -36,7 +37,8 @@ public:
                   PermissionManager *permission = nullptr,
                   SnapshotManager *snapshot = nullptr,
                   AgentManager *agents = nullptr,
-                  MemoryManager *memory = nullptr);
+                  MemoryManager *memory = nullptr,
+                  SkillManager *skills = nullptr);
 
     // Set a callback to get global working directories
     void setWorkingDirsGetter(std::function<std::vector<std::string>()> getter);
@@ -158,6 +160,7 @@ private:
     PermissionManager *m_permission = nullptr;
     AgentManager *m_agents = nullptr;
     MemoryManager *m_memory = nullptr;
+    SkillManager *m_skills = nullptr;
 
     // Callback to get global working directories
     std::function<std::vector<std::string>()> m_workingDirsGetter;
