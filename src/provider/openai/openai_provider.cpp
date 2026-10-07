@@ -154,6 +154,11 @@ json OpenAIProvider::buildRequestBody(const LLMRequest &request, bool streaming)
     if (request.temperature >= 0) {
         body["temperature"] = request.temperature;
     }
+    // Ask reasoning models to skip thinking (title generation etc.).
+    // Providers that don't recognize the field simply ignore it.
+    if (request.disableThinking) {
+        body["enable_thinking"] = false;
+    }
     body["max_tokens"] = request.maxTokens;
 
     json messages = json::array();

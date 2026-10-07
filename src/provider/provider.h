@@ -113,6 +113,9 @@ struct LLMRequest {
     double temperature = 0.7;
     int maxTokens = 4096;
     bool stream = true;
+    // Ask reasoning-capable models to skip the thinking phase (OpenAI-compatible
+    // "enable_thinking": false; ignored by providers that don't support it)
+    bool disableThinking = false;
 };
 
 // Abstract provider interface

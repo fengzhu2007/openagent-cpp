@@ -1075,18 +1075,47 @@ void SessionPrompt::generateTitleAsync(const std::string &sessionId, Provider *p
                 {"user", userText, {}, ""}
             };
             request.stream = false;
-            request.temperature = 0.5;
-            request.maxTokens = 50;
+            // Skip the reasoning phase: many providers (DashScope/Qwen3/GLM/
+            // DeepSeek-compatible gateways) accept "enable_thinking": false;
+            // others ignore the field. maxTokens stays generous as a fallback
+            // for gateways where thinking cannot be disabled.
+            request.disableThinking = true;
+            // -1 = omit temperature: some models (o1/o3/gpt-5 style reasoning
+            // APIs) reject non-default temperature with HTTP 400
+            request.temperature = -1.0;
+            // Reasoning models burn tokens on hidden thinking before emitting
+            // the title; 50 was too small and yielded null/truncated content
+            request.maxTokens = 500;
 
             json response = provider->chat(request);
 
-            std::string title;
-            if (response.contains("choices") && response["choices"].is_array() &&
-                !response["choices"].empty()) {
-                title = response["choices"][0]["message"]["content"].get<std::string>();
+            // Surface API-level errors instead of failing silently
+            if (response.contains("error")) {
+                LOG_WARN("Title generation failed, API error: "
+                         + response["error"].dump().substr(0, 500));
+                return;
             }
 
-            if (title.empty()) return;
+            std::string title;
+            if (response.contains("choices") && response["choices"].is_array() &&
+                !response["choices"].empty() && response["choices"][0].contains("message")) {
+                // OpenAI-compatible: choices[0].message.content (null when a
+                // reasoning model exhausts tokens in the thinking phase)
+                const json &content = response["choices"][0]["message"]["content"];
+                if (content.is_string()) {
+                    title = content.get<std::string>();
+                }
+            } else if (response.contains("content") && response["content"].is_array() &&
+                       !response["content"].empty() && response["content"][0].contains("text")) {
+                // Anthropic: content[0].text
+                title = response["content"][0]["text"].get<std::string>();
+            }
+
+            if (title.empty()) {
+                LOG_WARN("Title generation returned no usable content, response: "
+                         + response.dump().substr(0, 500));
+                return;
+            }
 
             // Clean up: remove think tags, trim
             auto thinkStart = title.find("<think>");
