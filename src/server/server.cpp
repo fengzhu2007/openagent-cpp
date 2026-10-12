@@ -18,6 +18,8 @@
 #include <fstream>
 #include <sstream>
 #include <set>
+#include <unordered_set>
+#include <unordered_map>
 #include <map>
 #ifdef _WIN32
 #include <windows.h>
@@ -1163,9 +1165,10 @@ void Server::handleDeleteSession(const httplib::Request &req, httplib::Response 
         return;
     }
 
-    // After session deletion, check if any snapshot repos are no longer
-    // referenced by remaining sessions and clean them up.
-    cleanupOrphanSnapshots();
+    // After session deletion, snapshot repos are kept alive for the server
+    // lifetime.  Orphan cleanup is deferred to shutdown or the next
+    // handleSetWorkingDirs call that drops the directory.
+    // cleanupOrphanSnapshots();
 
     bool isV2 = (req.path.rfind("/api/", 0) == 0);
     if (isV2) {
@@ -1232,30 +1235,53 @@ void Server::handleSetWorkingDirs(const httplib::Request &req, httplib::Response
         m_workingDirs = dirs;
     }
 
-    // Rebuild per-directory SnapshotManagers.  SessionPrompt accesses them
-    // through a callback (setSnapshotsGetter), so recreating the unique_ptrs
-    // here is safe — no dangling raw pointers.
-    {
-        // Cleanup old snapshot repos before rebuilding
-        for (auto &s : m_snapshots) {
-            s->cleanup();
-        }
-        m_snapshots.clear();
+    // Incremental update: reuse existing SnapshotManagers, add new ones,
+    // remove ones whose worktree is no longer in the list.
+    auto normalizePath = [](std::string p) {
+        std::replace(p.begin(), p.end(), '\\', '/');
+        return p;
+    };
 
-        std::string dataDir = m_config.getString("data_dir", ".");
-        for (const auto &d : dirs) {
-            // The snapshot repo is an independent bare repo: git commands run
-            // with GIT_DIR pointing at the shadow repo and GIT_WORK_TREE at
-            // the project, so the project itself does NOT have to be a git
-            // repository. Gating on isGitRepo() here silently disabled
-            // files_changed for non-git projects (snapshot list stayed empty).
+    // Build a set of incoming directories (normalized)
+    std::unordered_set<std::string> newDirSet;
+    for (const auto &d : dirs) newDirSet.insert(normalizePath(d));
+
+    // Build a map of existing SnapshotManagers by normalized worktree
+    std::unordered_map<std::string, size_t> oldMap;  // normalized worktree → index in m_snapshots
+    for (size_t i = 0; i < m_snapshots.size(); ++i) {
+        oldMap[normalizePath(m_snapshots[i]->worktree())] = i;
+    }
+
+    std::string dataDir = m_config.getString("data_dir", ".");
+    std::vector<std::unique_ptr<SnapshotManager>> kept;
+
+    for (const auto &d : dirs) {
+        std::string nd = normalizePath(d);
+        auto it = oldMap.find(nd);
+        if (it != oldMap.end()) {
+            // Directory unchanged — reuse existing SnapshotManager
+            kept.push_back(std::move(m_snapshots[it->second]));
+            LOG_INFO("[Server] setWorkingDirs: reused worktree " + d);
+        } else {
+            // New directory — create and init
             bool gitRepo = SnapshotManager::isGitRepo(d);
-            m_snapshots.push_back(std::make_unique<SnapshotManager>(dataDir, d));
-            m_snapshots.back()->initBaseline();
-            LOG_INFO(std::string("[Server] SnapshotManager created for worktree: ") + d +
+            kept.push_back(std::make_unique<SnapshotManager>(dataDir, d));
+            kept.back()->initBaseline();
+            LOG_INFO(std::string("[Server] setWorkingDirs: added worktree: ") + d +
                      (gitRepo ? "" : " (not a git repo, shadow-repo tracking only)"));
         }
     }
+
+    // Cleanup SnapshotManagers whose worktree was removed
+    for (size_t i = 0; i < m_snapshots.size(); ++i) {
+        std::string nw = normalizePath(m_snapshots[i]->worktree());
+        if (newDirSet.find(nw) == newDirSet.end()) {
+            LOG_INFO("[Server] setWorkingDirs: removed worktree " + m_snapshots[i]->worktree());
+            m_snapshots[i]->cleanup();
+        }
+    }
+
+    m_snapshots = std::move(kept);
 
     LOG_INFO("[Server] setWorkingDirs: " + std::to_string(dirs.size()) + " dirs");
 

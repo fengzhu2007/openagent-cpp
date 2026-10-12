@@ -183,8 +183,9 @@ void SnapshotManager::cleanup()
         // On Windows, git bare repos have read-only object files.
         // Use system command which handles read-only files natively.
         // Convert to wide string for CJK path support.
+        // Use CP_ACP because fs::absolute().string() returns system ANSI codepage on Windows.
         std::wstring wPath(m_repoPath.size(), L'\0');
-        int wlen = MultiByteToWideChar(CP_UTF8, 0, m_repoPath.c_str(), -1, &wPath[0], static_cast<int>(wPath.size()));
+        int wlen = MultiByteToWideChar(CP_ACP, 0, m_repoPath.c_str(), -1, &wPath[0], static_cast<int>(wPath.size()));
         if (wlen > 0) {
             wPath.resize(wlen - 1);  // -1 for null terminator
             std::wstring cmd = L"cmd /c rd /s /q \"" + wPath + L"\"";
