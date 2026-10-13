@@ -32,6 +32,9 @@ private:
         std::string id;
         std::string name;
         std::string arguments;
+        // Gemini thought signature (extra_content.google.thought_signature);
+        // stays empty for every other provider
+        std::string thoughtSignature;
         bool startEmitted = false;
     };
     std::vector<PendingToolCall> m_pendingTools;

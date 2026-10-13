@@ -698,7 +698,11 @@ bool SnapshotManager::initAlternatesBaselineLocked()
     mkdir(altDir.c_str(), 0755);
 #endif
     std::string altPath = altDir + PATH_SEP + "alternates";
-    std::ofstream altFile(altPath);
+    // Binary mode: text mode converts "\n" to "\r\n" on Windows, and git
+    // keeps the trailing '\r' as part of the path when parsing alternates,
+    // so the object directory never resolves ("object directory ... does
+    // not exist") and commit-tree fails — leaving the repo without a HEAD.
+    std::ofstream altFile(altPath, std::ios::binary);
     if (!altFile.is_open()) {
         LOG_ERROR("[initAlternates] failed to write alternates file");
         return false;
@@ -718,8 +722,13 @@ bool SnapshotManager::initAlternatesBaselineLocked()
     }
     LOG_INFO("[initAlternates] worktree tree hash: " + treeHash);
 
-    // Create baseline commit in shadow repo using worktree's tree
-    commitTreeLocked(treeHash);
+    // Create baseline commit in shadow repo using worktree's tree.
+    // Check the result: a silent failure here would leave the repo without
+    // a HEAD while initBaseline() believes the alternates path succeeded.
+    if (commitTreeLocked(treeHash).empty()) {
+        LOG_ERROR("[initAlternates] commitTreeLocked failed for tree " + treeHash);
+        return false;
+    }
 
     // Sync index to HEAD so git status works correctly
     gitExec("read-tree HEAD", true);

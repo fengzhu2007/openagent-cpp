@@ -21,8 +21,13 @@ public:
 
 private:
     void initFromProviderConfig(const Config::ProviderConfig &pc);
+    // True when this provider points at the Gemini API (native Gemini host or
+    // a provider configured as gemini). Gates the thought-signature replay so
+    // strict OpenAI-compatible endpoints never see the extra_content field.
+    bool isGeminiEndpoint() const;
     json buildRequestBody(const LLMRequest &request, bool streaming) const;
     json buildToolDefinition(const ToolDefinition &tool) const;
+    json buildToolCallsArray(const std::vector<ToolCall> &toolCalls) const;
     json buildMessage(const ChatMessage &msg) const;
 
     std::string m_providerId;

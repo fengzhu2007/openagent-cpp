@@ -188,7 +188,7 @@ void OpenAIStreamParser::parseDelta(const json &delta)
             if (!pending.id.empty() && !pending.name.empty() && !pending.startEmitted) {
                 LLMEvent tcStart;
                 tcStart.type = LLMEvent::ToolCallStart;
-                tcStart.toolCall = {pending.id, pending.name, {}};
+                tcStart.toolCall = {pending.id, pending.name, {}, pending.thoughtSignature};
                 m_callback(tcStart);
                 pending.startEmitted = true;
             }
@@ -198,6 +198,16 @@ void OpenAIStreamParser::parseDelta(const json &delta)
             if (tc.contains("function") && tc["function"].contains("arguments")
                 && tc["function"]["arguments"].is_string()) {
                 pending.arguments += tc["function"]["arguments"].get<std::string>();
+            }
+
+            // Gemini OpenAI-compat layer returns the thought signature on the
+            // first delta of a call (next to id/name). Gemini 3 requires it on
+            // replay; other providers never emit the field so it stays empty.
+            if (tc.contains("extra_content") && tc["extra_content"].is_object()
+                && tc["extra_content"].contains("google") && tc["extra_content"]["google"].is_object()
+                && tc["extra_content"]["google"].contains("thought_signature")
+                && tc["extra_content"]["google"]["thought_signature"].is_string()) {
+                pending.thoughtSignature = tc["extra_content"]["google"]["thought_signature"].get<std::string>();
             }
         }
     }
@@ -216,7 +226,7 @@ void OpenAIStreamParser::flushPendingTools()
         if (tc.id.empty() || tc.name.empty()) continue;
         LLMEvent tcEnd;
         tcEnd.type = LLMEvent::ToolCallEnd;
-        tcEnd.toolCall = {tc.id, tc.name, parseToolArguments(tc.arguments)};
+        tcEnd.toolCall = {tc.id, tc.name, parseToolArguments(tc.arguments), tc.thoughtSignature};
         m_callback(tcEnd);
     }
     m_pendingTools.clear();

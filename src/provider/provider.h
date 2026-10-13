@@ -13,6 +13,10 @@ struct ToolCall {
     std::string id;
     std::string name;
     json arguments;
+    // Gemini thought signature (OpenAI-compat: extra_content.google.thought_signature).
+    // Gemini 3 rejects replayed function calls without it (HTTP 400). Empty for
+    // every other provider; only replayed to Gemini endpoints.
+    std::string thoughtSignature;
 };
 
 // Parse accumulated tool-call argument text (opencode v1 parseToolInput

@@ -48,6 +48,14 @@ OpenAIProvider::OpenAIProvider(const Config &config)
 std::string OpenAIProvider::id() const { return m_providerId; }
 std::string OpenAIProvider::name() const { return "OpenAI Compatible"; }
 
+bool OpenAIProvider::isGeminiEndpoint() const
+{
+    // Native Gemini OpenAI-compat host; provider id match also covers
+    // proxies configured as the gemini provider under a different URL
+    return m_apiUrl.find("generativelanguage.googleapis.com") != std::string::npos
+        || m_providerId.find("gemini") != std::string::npos;
+}
+
 std::vector<std::string> OpenAIProvider::listModels() const
 {
     return m_models;
@@ -89,18 +97,7 @@ json OpenAIProvider::buildMessage(const ChatMessage &msg) const
         }
         m["content"] = contentArr;
         if (!msg.toolCalls.empty()) {
-            json tools = json::array();
-            for (const auto &tc : msg.toolCalls) {
-                json t;
-                t["id"] = tc.id;
-                t["type"] = "function";
-                t["function"] = {
-                    {"name", tc.name},
-                    {"arguments", tc.arguments.is_string() ? tc.arguments.get<std::string>() : tc.arguments.dump()}
-                };
-                tools.push_back(t);
-            }
-            m["tool_calls"] = tools;
+            m["tool_calls"] = buildToolCallsArray(msg.toolCalls);
         }
     } else {
         // Plain text content
@@ -112,18 +109,7 @@ json OpenAIProvider::buildMessage(const ChatMessage &msg) const
             m["content"] = nullptr;
         }
         if (!msg.toolCalls.empty()) {
-            json tools = json::array();
-            for (const auto &tc : msg.toolCalls) {
-                json t;
-                t["id"] = tc.id;
-                t["type"] = "function";
-                t["function"] = {
-                    {"name", tc.name},
-                    {"arguments", tc.arguments.is_string() ? tc.arguments.get<std::string>() : tc.arguments.dump()}
-                };
-                tools.push_back(t);
-            }
-            m["tool_calls"] = tools;
+            m["tool_calls"] = buildToolCallsArray(msg.toolCalls);
         }
     }
     return m;
@@ -139,6 +125,36 @@ json OpenAIProvider::buildToolDefinition(const ToolDefinition &tool) const
             {"parameters", tool.parameters}
         }}
     };
+}
+
+json OpenAIProvider::buildToolCallsArray(const std::vector<ToolCall> &toolCalls) const
+{
+    json tools = json::array();
+    for (const auto &tc : toolCalls) {
+        json t;
+        t["id"] = tc.id;
+        t["type"] = "function";
+        t["function"] = {
+            {"name", tc.name},
+            {"arguments", tc.arguments.is_string() ? tc.arguments.get<std::string>() : tc.arguments.dump()}
+        };
+        // Gemini requires the original thought signature on every replayed
+        // function call (HTTP 400 otherwise); entries recorded before the
+        // signature was preserved get the official skip marker instead.
+        // Skipped on other providers so strict OpenAI-compatible endpoints
+        // never see the unknown extra_content field.
+        if (isGeminiEndpoint()) {
+            t["extra_content"] = json::object({
+                {"google", json::object({
+                    {"thought_signature", tc.thoughtSignature.empty()
+                        ? std::string("skip_thought_signature_validator")
+                        : tc.thoughtSignature}
+                })}
+            });
+        }
+        tools.push_back(t);
+    }
+    return tools;
 }
 
 json OpenAIProvider::buildRequestBody(const LLMRequest &request, bool streaming) const

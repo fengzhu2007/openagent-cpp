@@ -529,6 +529,9 @@ std::vector<ChatMessage> SessionPrompt::buildChatMessages(const std::string &ses
                     ToolCall tc;
                     tc.id = callId;
                     tc.name = part.data.value("tool", "");
+                    // Gemini thought signature recorded when the call was made;
+                    // empty for every other provider
+                    tc.thoughtSignature = part.data.value("thoughtSignature", "");
                     if (part.data.contains("state") && part.data["state"].is_object()) {
                         auto &state = part.data["state"];
                         if (state.contains("input")) {
@@ -548,6 +551,7 @@ std::vector<ChatMessage> SessionPrompt::buildChatMessages(const std::string &ses
                     ToolCall tc;
                     tc.id = callId;
                     tc.name = part.data.value("name", "");
+                    tc.thoughtSignature = part.data.value("thoughtSignature", "");
                     try {
                         tc.arguments = json::parse(part.data.value("arguments", "{}"));
                     } catch (...) {
@@ -1639,6 +1643,11 @@ RoundResult SessionPrompt::processLLMRound(const std::string &sessionId, const s
                         {"status", "pending"},
                         {"input", input}
                     });
+                    // Preserve the Gemini thought signature so later turns can
+                    // replay this call; empty (nothing stored) for other providers
+                    if (!event.toolCall.thoughtSignature.empty()) {
+                        partIt->second.data["thoughtSignature"] = event.toolCall.thoughtSignature;
+                    }
                     partIt->second.timeUpdated = util::nowMs();
                     m_sessionMgr.updatePart(partIt->second);
                 } else {
@@ -1656,6 +1665,9 @@ RoundResult SessionPrompt::processLLMRound(const std::string &sessionId, const s
                             {"input", input}
                         })}
                     });
+                    if (!event.toolCall.thoughtSignature.empty()) {
+                        toolPart.data["thoughtSignature"] = event.toolCall.thoughtSignature;
+                    }
                     toolPart.timeCreated = util::nowMs();
                     toolPart.timeUpdated = toolPart.timeCreated;
                     m_sessionMgr.addPart(toolPart);
